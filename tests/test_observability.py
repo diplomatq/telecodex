@@ -1469,6 +1469,51 @@ async def test_voice_disabled_reply_contains_navigation_keyboard(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_voice_transcription_is_echoed_before_codex_run(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(
+        tmp_path,
+        enable_voice_messages=True,
+        voice_provider="openai_compatible",
+        voice_api_key="key",
+        voice_api_base_url="https://api.groq.com/openai/v1",
+        voice_transcription_model="whisper-large-v3-turbo",
+    )
+    bot = CodexTelegramBot(settings, store)
+    bot.codex = FakeCodex(
+        CodexResponse(final_text="done", thread_id="thread-123", status=CodexResultStatus.SUCCESS)
+    )
+
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+
+    update = FakeUpdate(user_id=42)
+    update.effective_message.voice = SimpleNamespace(duration=4)
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+
+    class FakeTranscriber:
+        async def transcribe(self, voice, caption=None):
+            return SimpleNamespace(
+                prompt="Voice message transcription:\n\nhello from groq",
+                transcription="hello from groq",
+                duration_seconds=4,
+            )
+
+    bot.voice = FakeTranscriber()
+
+    await bot.handle_voice(update, context)
+
+    replies = update.effective_message.replies
+    assert replies[0].text == "Transcribing..."
+    assert replies[0].progress.deleted is True
+    assert replies[1].text == "Транскрипция:\n\nhello from groq"
+    assert bot.codex.calls[-1]["prompt"] == "Voice message transcription:\n\nhello from groq"
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_photo_request_cleans_temp_files_after_run(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "db.sqlite3")
     await store.initialize()

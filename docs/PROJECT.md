@@ -237,6 +237,28 @@ A run stores:
 
 This powers `/workspace`, `/tasks`, run detail screens, and operator CLI tooling.
 
+## Improvement Backlog
+
+1. Remove secrets from the repository and stop keeping working tokens in `.env`. The current setup stores real `TELEGRAM_BOT_TOKEN` and `VOICE_API_KEY`, which is the highest operational risk.
+
+2. Move Telegram UI screens away from raw `parse_mode="Markdown"` toward a single safe rendering path. The recent entity parsing failure showed that one formatting character in UI text can break the bot.
+
+3. Add a real integration smoke test for startup flow: `Settings`, SQLite initialization, orphaned-run finalization, and Telegram app build. Current tests are strong at module level, but not enough for config/runtime regressions.
+
+4. Strengthen run lifecycle semantics by separating completion causes more explicitly: `completed`, `failed`, `timeout`, `stopped_by_user`, `orphaned_after_restart`. Right now too much collapses into `interrupted`, which weakens debugging.
+
+5. Improve restart recovery UX. The store already finalizes orphaned runs on boot; next step is a clearer user-facing state like "interrupted after restart" with an obvious choice to restore context or start fresh.
+
+6. Improve voice-message UX in the Telegram flow. In addition to the transcript echo, show clearer staged progress such as "downloading", "transcribing", and "starting Codex" so the bot does not look frozen.
+
+7. Add stronger regression coverage for keyboards and workspace screens. Snapshot-style tests for `/menu`, `/workspace`, `/tasks`, and `/mode` would catch both text and callback regressions earlier.
+
+8. Add an operator self-check command or local health check. It should validate `.env`, Codex CLI availability, SQLite connectivity, workspace visibility, and voice configuration in one pass.
+
+9. Simplify capability configuration around inputs and optional features. A more explicit runtime capability model for `text/files/voice/images/status-line-live` would reduce scattered conditional logic.
+
+10. Strengthen deployment guidance around `systemd` and production operation. The project already has service tooling; the next step is to make service-based deployment the default documented path instead of manual foreground launch.
+
 ## SQLite Schema
 
 Key tables:

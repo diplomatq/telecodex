@@ -253,10 +253,27 @@ def test_render_workspace_text_includes_project_and_progress() -> None:
         recent_run_count=1,
     )
     text = render_workspace_text([summary], active_run_count=1, active_run_limit=5)
-    assert "`api`" in text
+    assert "⏵◉ `api` · `running`" in text
     assert "Активных процессов: `1`" in text
     assert "🔧 Read" in text
     assert "сессия `thread-1`" in text
+    assert "`⏵` активный запуск · `◉` текущий проект" in text
+
+
+def test_render_workspace_text_marks_current_project_without_play_for_finished_run() -> None:
+    summary = ProjectActivitySummary(
+        project_path="/tmp/api",
+        project_name="api",
+        is_current=True,
+        current_session_thread_id="thread-123",
+        latest_run=make_project_run(run_id=7, status=ProjectRunStatus.INTERRUPTED),
+        recent_run_count=1,
+    )
+
+    text = render_workspace_text([summary])
+
+    assert "•◉ `api` · `interrupted`" in text
+    assert text.count("⏵") == 1
 
 
 def test_render_workspace_text_hides_idle_projects() -> None:

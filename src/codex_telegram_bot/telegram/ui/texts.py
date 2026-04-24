@@ -411,10 +411,12 @@ def render_workspace_text(
         lines.append("Нет активных или завершённых процессов.")
         return "\n".join(lines)
     for summary in visible_summaries:
-        marker = "•"
-        if summary.is_current:
-            marker = "▶"
         run = summary.active_run or summary.latest_run
+        marker = "•"
+        if summary.active_run is not None:
+            marker = "⏵"
+        if summary.is_current:
+            marker = f"{marker}◉"
         status = run.status.value
         lines.append(f"{marker} `{summary.project_name}` · `{status}`")
         lines.append(
@@ -427,6 +429,7 @@ def render_workspace_text(
         if summary.recent_run_count:
             lines.append(f"запусков в списке: `{summary.recent_run_count}`")
         lines.append("")
+    lines.append("`⏵` активный запуск · `◉` текущий проект")
     return "\n".join(lines).strip()
 
 

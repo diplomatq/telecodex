@@ -104,6 +104,9 @@ class MessageInputPreparer:
             )
             request_context.prompt_chars = len(processed.prompt)
             await progress.delete()
+            await update.effective_message.reply_text(
+                f"Транскрипция:\n\n{processed.transcription}"
+            )
             return PreparedCodexRequest(prompt=processed.prompt, source="voice")
         except Exception as exc:
             await self.observability.record_event(
