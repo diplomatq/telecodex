@@ -50,7 +50,7 @@ def test_workspace_cli_summary_and_attach(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     assert workspace_cli.run(["run", "attach", str(run_id)]) == 0
     output = capsys.readouterr().out
-    assert "Attached thread-1 to api" in output
+    assert f"Attached thread-1 to {str(project_dir.resolve().parent / project_dir.resolve().name)}" in output
 
     conn = sqlite3.connect(settings.sqlite_path)
     try:
@@ -109,3 +109,40 @@ def test_workspace_cli_stop_and_project_switch(monkeypatch: pytest.MonkeyPatch, 
 
     assert workspace_cli.run(["project", "switch", "web"]) == 0
     assert "Current project: web" in capsys.readouterr().out
+
+
+def test_workspace_cli_hides_idle_and_supports_extra_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    project_dir = tmp_path / "api"
+    extra_root = tmp_path / "extra"
+    extra_project = extra_root / "worker"
+    project_dir.mkdir()
+    extra_root.mkdir()
+    extra_project.mkdir()
+    settings = make_settings(
+        tmp_path,
+        additional_project_directories=[extra_root],
+        project_ignore_names=["ignored"],
+    )
+    monkeypatch.setattr(workspace_cli, "Settings", lambda: settings)
+    workspace_cli._ensure_schema(settings.sqlite_path)
+
+    conn = sqlite3.connect(settings.sqlite_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO project_runs (
+                user_id, project_path, thread_id, status, started_at, finished_at, last_update_at,
+                first_prompt_preview, last_progress_summary, first_tool_name, tool_count, error_message, stop_requested
+            )
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+            """,
+            (42, str(extra_project.resolve()), "thread-1", "success", "Prompt", "Done", "Read", 1, "", 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert workspace_cli.run(["workspace"]) == 0
+    output = capsys.readouterr().out
+    assert "api: idle" not in output
+    assert "extra/worker: success" in output

@@ -476,7 +476,8 @@ async def test_start_command_returns_home_text_without_reply_keyboard(tmp_path: 
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
         ["action:new"],
-        ["repo:quick:web", "repo:quick:api", "nav:repo"],
+        [f"repo:quick:{str((tmp_path / 'web').resolve())}", f"repo:quick:{str((tmp_path / 'api').resolve())}"],
+        ["nav:repo"],
     ]
     await store.close()
 
@@ -625,7 +626,8 @@ async def test_menu_command_opens_session_card(tmp_path: Path) -> None:
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
         ["action:new"],
-        ["repo:quick:app", "repo:quick:web", "nav:repo"],
+        [f"repo:quick:{str(project_dir.resolve())}", f"repo:quick:{str(other_dir.resolve())}"],
+        ["nav:repo"],
     ]
     await store.close()
 
@@ -652,7 +654,7 @@ async def test_sessions_command_lists_project_sessions(tmp_path: Path) -> None:
 
     reply = update.effective_message.replies[-1]
     assert "Сессии." in reply.text
-    assert "Проект: `app`" in reply.text
+    assert f"Проект: `{str(project_dir.resolve().parent / project_dir.resolve().name)}`" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
         ["session:select:old-session"],
         ["session:refresh", "action:new"],
@@ -784,8 +786,8 @@ async def test_repo_command_renders_inline_picker(tmp_path: Path) -> None:
     reply = update.effective_message.replies[-1]
     assert "Проекты." in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
-        ["repo:select:api"],
-        ["repo:select:web"],
+        [f"repo:select:{str((tmp_path / 'api').resolve())}"],
+        [f"repo:select:{str((tmp_path / 'web').resolve())}"],
         ["action:create_project"],
         ["nav:menu"],
     ]
@@ -810,7 +812,7 @@ async def test_repo_command_auto_creates_project_in_empty_workspace(
     assert "Создан первый проект" in reply.text
     assert Path(context.user_data["current_directory"]).name == "2026-04-18-project"
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
-        ["repo:select:2026-04-18-project"],
+        [f"repo:select:{str((tmp_path / '2026-04-18-project').resolve())}"],
         ["action:create_project"],
         ["nav:menu"],
     ]
@@ -829,7 +831,8 @@ async def test_repo_new_command_creates_and_selects_project(tmp_path: Path) -> N
     await bot.repo_command(update, context)
 
     reply = update.effective_message.replies[-1]
-    assert "Новый проект: `my-api`." in reply.text
+    project_dir = (tmp_path / "my-api").resolve()
+    assert f"Новый проект: `{str(project_dir.parent / project_dir.name)}`." in reply.text
     assert Path(context.user_data["current_directory"]).name == "my-api"
     assert (tmp_path / "my-api").is_dir()
     await store.close()
@@ -865,14 +868,15 @@ async def test_repo_select_callback_switches_directory_and_audits(
     fake_logger = FakeLogger()
     attach_fake_logger(bot, fake_logger)
 
-    callback_query = FakeCallbackQuery(from_user_id=42, data="repo:select:web")
+    web_dir = (tmp_path / "web").resolve()
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"repo:select:{str(web_dir)}")
     update = FakeUpdate(user_id=42, callback_query=callback_query)
     context = FakeContext()
 
     await bot.handle_ui_callback(update, context)
 
     assert Path(context.user_data["current_directory"]).name == "web"
-    assert "web" in callback_query.edits[-1][0]
+    assert str(web_dir.parent / web_dir.name) in callback_query.edits[-1][0]
     rows = await store.conn.execute_fetchall(
         "SELECT event_type FROM audit_log WHERE event_type = 'telegram_repo_selected'"
     )
@@ -899,7 +903,8 @@ async def test_create_project_callback_uses_suffix_when_name_is_taken(
     await bot.handle_ui_callback(update, context)
 
     assert Path(context.user_data["current_directory"]).name == "2026-04-18-project-2"
-    assert "2026-04-18-project-2" in callback_query.edits[-1][0]
+    created_dir = (tmp_path / "2026-04-18-project-2").resolve()
+    assert str(created_dir.parent / created_dir.name) in callback_query.edits[-1][0]
     await store.close()
 
 
@@ -992,8 +997,9 @@ async def test_handle_text_writes_request_started_and_finished(
     stop_callback = keyboard_callback_data(update.effective_message.replies[1].kwargs["reply_markup"])[0][0]
     assert stop_callback.startswith("action:stop:")
     assert stop_callback.endswith(":42")
+    project_dir = (tmp_path / "2026-04-18-project").resolve()
     assert update.effective_message.replies[1].text == (
-        "Проект: 2026-04-18-project\n\nWorking... 0s"
+        f"Проект: {str(project_dir.parent / project_dir.name)}\n\nWorking... 0s"
     )
     assert update.effective_message.replies[-1].kwargs["parse_mode"] == "HTML"
     assert "Проект:" in update.effective_message.replies[-1].text
@@ -1091,7 +1097,7 @@ async def test_repo_select_callback_allows_switching_away_from_project_with_acti
         )
     )
 
-    callback_query = FakeCallbackQuery(from_user_id=42, data="repo:select:web")
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"repo:select:{str(web_dir)}")
     update = FakeUpdate(user_id=42, callback_query=callback_query)
 
     await bot.handle_ui_callback(update, context)
@@ -1115,19 +1121,20 @@ async def test_quick_repo_select_callback_switches_project_from_menu(tmp_path: P
     context.user_data["current_directory"] = api_dir
     await store.set_current_project(42, str(api_dir))
 
-    callback_query = FakeCallbackQuery(from_user_id=42, data="repo:quick:web")
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"repo:quick:{str(web_dir)}")
     update = FakeUpdate(user_id=42, callback_query=callback_query)
 
     await bot.handle_ui_callback(update, context)
 
     assert Path(context.user_data["current_directory"]).name == "web"
     assert callback_query.answers[-1] == ("Переключено: web", False)
-    assert "Текущий проект: `web`." in callback_query.edits[-1][0]
+    assert f"Текущий проект: `{str(web_dir.parent / web_dir.name)}`." in callback_query.edits[-1][0]
     assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
         ["action:new"],
-        ["repo:quick:web", "repo:quick:api", "nav:repo"],
+        [f"repo:quick:{str(web_dir)}", f"repo:quick:{str(api_dir)}"],
+        ["nav:repo"],
     ]
     assert store.current_project[42] == str(web_dir)
     await store.close()
@@ -1324,7 +1331,7 @@ async def test_handle_text_sends_typing_heartbeat_and_elapsed_progress(
     await bot.handle_text(update, context)
 
     progress_reply = update.effective_message.replies[0]
-    assert progress_reply.text == "Проект: app\n\nWorking... 0s"
+    assert progress_reply.text == f"Проект: {str(project_dir.resolve().parent / project_dir.resolve().name)}\n\nWorking... 0s"
     assert progress_reply.progress.deleted is True
     await store.close()
 
@@ -1596,7 +1603,8 @@ async def test_repo_command_switches_project_even_when_another_run_is_active(tmp
     await bot.repo_command(update, context)
 
     assert Path(context.user_data["current_directory"]).name == "api"
-    assert "Текущий проект: `api`." in update.effective_message.replies[-1].text
+    api_dir = (tmp_path / "api").resolve()
+    assert f"Текущий проект: `{str(api_dir.parent / api_dir.name)}`." in update.effective_message.replies[-1].text
     await store.close()
 
 
@@ -1632,7 +1640,7 @@ async def test_selected_project_is_restored_after_restart(tmp_path: Path) -> Non
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
 
-    callback_query = FakeCallbackQuery(from_user_id=42, data="repo:select:web")
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"repo:select:{str((tmp_path / 'web').resolve())}")
     update = FakeUpdate(user_id=42, callback_query=callback_query)
     context = FakeContext()
     await bot.handle_ui_callback(update, context)
@@ -1646,7 +1654,8 @@ async def test_selected_project_is_restored_after_restart(tmp_path: Path) -> Non
     await restarted_bot.menu_command(restarted_update, restarted_context)
 
     assert Path(restarted_context.user_data["current_directory"]).name == "web"
-    assert "Проект: `web`" in restarted_update.effective_message.replies[-1].text
+    web_dir = (tmp_path / "web").resolve()
+    assert f"Проект: `{str(web_dir.parent / web_dir.name)}`" in restarted_update.effective_message.replies[-1].text
     await restarted_store.close()
 
 

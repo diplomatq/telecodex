@@ -65,9 +65,11 @@ def test_build_session_keyboard_has_expected_actions() -> None:
 def test_build_session_keyboard_adds_recent_project_shortcuts() -> None:
     markup = build_session_keyboard(
         [
-            RecentProjectOption(slug="api", label="api", is_current=True),
-            RecentProjectOption(slug="web", label="web"),
-            RecentProjectOption(slug="ops", label="ops"),
+            RecentProjectOption(key="/tmp/api", slug="api", label="api", is_current=True),
+            RecentProjectOption(key="/tmp/web", slug="web", label="web"),
+            RecentProjectOption(key="/tmp/ops", slug="ops", label="ops"),
+            RecentProjectOption(key="/tmp/ml", slug="ml", label="ml"),
+            RecentProjectOption(key="/tmp/bot", slug="bot", label="bot"),
         ]
     )
 
@@ -75,10 +77,12 @@ def test_build_session_keyboard_adds_recent_project_shortcuts() -> None:
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
         ["action:new"],
-        ["repo:quick:api", "repo:quick:web", "repo:quick:ops", "nav:repo"],
+        ["repo:quick:/tmp/api", "repo:quick:/tmp/web", "repo:quick:/tmp/ops"],
+        ["repo:quick:/tmp/ml", "repo:quick:/tmp/bot"],
+        ["nav:repo"],
     ]
     assert markup.inline_keyboard[3][0].text == "◉ api"
-    assert markup.inline_keyboard[3][3].text == "Ещё…"
+    assert markup.inline_keyboard[5][0].text == "Ещё…"
 
 
 def test_build_local_sessions_keyboard_uses_prompt_and_short_id_fallback() -> None:
@@ -117,10 +121,10 @@ def test_build_local_sessions_keyboard_uses_prompt_and_short_id_fallback() -> No
 
 
 def test_build_repo_keyboard_ends_with_back_to_menu() -> None:
-    markup = build_repo_keyboard([RepoOption(slug="api", label="api")])
+    markup = build_repo_keyboard([RepoOption(key="/tmp/api", slug="api", label="api")])
 
     assert keyboard_callback_data(markup) == [
-        ["repo:select:api"],
+        ["repo:select:/tmp/api"],
         ["action:create_project"],
         ["nav:menu"],
     ]
@@ -128,13 +132,23 @@ def test_build_repo_keyboard_ends_with_back_to_menu() -> None:
 
 def test_render_repo_picker_text_marks_current_project() -> None:
     text = render_repo_picker_text(
-        [RepoOption(slug="api", label="api", is_current=True)],
+        [RepoOption(key="/tmp/api", slug="api", label="api", is_current=True)],
         truncated=False,
         auto_created=True,
     )
 
     assert "Создан первый проект `api`." in text
     assert "Текущий: `api`" in text
+
+
+def test_render_repo_picker_text_uses_labels() -> None:
+    text = render_repo_picker_text(
+        [RepoOption(key="/tmp/extra/worker", slug="worker", label="extra/worker", is_current=True)],
+        truncated=False,
+        auto_created=False,
+    )
+
+    assert "Текущий: `worker`" in text
 
 
 def test_render_final_text_appends_interrupted_marker() -> None:
@@ -243,6 +257,23 @@ def test_render_workspace_text_includes_project_and_progress() -> None:
     assert "Активных процессов: `1`" in text
     assert "🔧 Read" in text
     assert "сессия `thread-1`" in text
+
+
+def test_render_workspace_text_hides_idle_projects() -> None:
+    summary = ProjectActivitySummary(
+        project_path="/tmp/api",
+        project_name="api",
+        is_current=True,
+        current_session_thread_id="thread-123",
+        active_run=None,
+        latest_run=None,
+        recent_run_count=0,
+    )
+
+    text = render_workspace_text([summary])
+
+    assert "idle" not in text
+    assert "Нет активных или завершённых процессов." in text
 
 
 def test_project_run_and_detail_keyboards() -> None:

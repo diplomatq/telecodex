@@ -41,6 +41,7 @@ from ..telegram.ui.texts import (
     render_launch_mode_editor_text,
     render_launch_mode_label,
     render_no_projects_text,
+    render_project_display_name,
     wrap_project_message,
 )
 
@@ -177,7 +178,7 @@ class PromptExecutionFlow:
                 project_path=project.path,
             )
             text = render_launch_mode_editor_text(
-                project_name=project.path.name,
+                project_name=render_project_display_name(project.path),
                 launch_mode=launch_mode,
                 has_active_run=self.has_active_run(update.effective_user.id),
                 notice=notice,
@@ -246,7 +247,7 @@ class PromptExecutionFlow:
             return
         await self.responder.edit_callback_message(
             update,
-            render_full_access_warning_text(project_name=project.path.name),
+            render_full_access_warning_text(project_name=render_project_display_name(project.path)),
             reply_markup=build_full_access_warning_keyboard("mode:show"),
             parse_mode="Markdown",
         )
@@ -313,7 +314,7 @@ class PromptExecutionFlow:
         request_context.launch_mode = launch_mode.value
         if project.auto_created:
             await update.effective_message.reply_text(
-                f"Создал и выбрал первый проект: `{cwd.name}`.",
+                f"Создал и выбрал первый проект: `{render_project_display_name(cwd)}`.",
                 parse_mode="Markdown",
             )
 
@@ -360,7 +361,7 @@ class PromptExecutionFlow:
         request_started_at = time.monotonic()
         await update.effective_chat.send_action(ChatAction.TYPING)
         progress = await update.effective_message.reply_text(
-            build_progress_text(0, [], project_name=cwd.name),
+            build_progress_text(0, [], project_name=render_project_display_name(cwd)),
             reply_markup=stop_markup,
         )
         request_finished = asyncio.Event()
@@ -451,11 +452,11 @@ class PromptExecutionFlow:
             )
             try:
                 await progress.edit_text(
-                        build_progress_text(
-                            int(time.monotonic() - request_started_at),
-                            last_progress_lines,
-                            project_name=cwd.name,
-                        ),
+                    build_progress_text(
+                        int(time.monotonic() - request_started_at),
+                        last_progress_lines,
+                        project_name=render_project_display_name(cwd),
+                    ),
                     reply_markup=stop_markup if not interrupt_event.is_set() else None,
                 )
             except Exception:
@@ -776,7 +777,11 @@ class PromptExecutionFlow:
                     build_progress_text(
                         int(time.monotonic() - request_started_at),
                         last_progress_lines,
-                        project_name=Path(request_context.cwd).name if request_context.cwd else "",
+                        project_name=(
+                            render_project_display_name(Path(request_context.cwd))
+                            if request_context.cwd
+                            else ""
+                        ),
                     ),
                     reply_markup=stop_markup if not interrupt_event.is_set() else None,
                 )

@@ -36,14 +36,19 @@ def build_session_keyboard(recent_projects: list[RecentProjectOption] | None = N
         ],
     ]
     if recent_projects and len(recent_projects) >= 2:
-        shortcut_row = []
-        for project in recent_projects[:3]:
+        first_row = []
+        second_row = []
+        for index, project in enumerate(recent_projects[:5]):
             label = f"◉ {project.label}" if project.is_current else project.label
-            shortcut_row.append(
-                InlineKeyboardButton(label, callback_data=f"repo:quick:{project.slug}")
+            target_row = first_row if index < 3 else second_row
+            target_row.append(
+                InlineKeyboardButton(label, callback_data=f"repo:quick:{project.key}")
             )
-        shortcut_row.append(InlineKeyboardButton("Ещё…", callback_data="nav:repo"))
-        rows.append(shortcut_row)
+        if first_row:
+            rows.append(first_row)
+        if second_row:
+            rows.append(second_row)
+        rows.append([InlineKeyboardButton("Ещё…", callback_data="nav:repo")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -79,7 +84,7 @@ def build_verbose_keyboard(current_level: int) -> InlineKeyboardMarkup:
 
 def build_repo_keyboard(entries: list[RepoOption]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(entry.label, callback_data=f"repo:select:{entry.slug}")]
+        [InlineKeyboardButton(entry.label, callback_data=f"repo:select:{entry.key}")]
         for entry in entries
     ]
     rows.append([InlineKeyboardButton("➕ Создать проект", callback_data="action:create_project")])

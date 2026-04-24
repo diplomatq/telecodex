@@ -54,7 +54,52 @@ def test_list_repo_options_marks_current_project(tmp_path: Path) -> None:
     assert [option.slug for option in options] == ["api", "web"]
     assert options[0].is_current is False
     assert options[1].is_current is True
-    assert options[1].label == "web"
+    assert options[1].label == str((tmp_path / "web").resolve())
+
+
+def test_list_repo_options_supports_extra_roots_and_filters(tmp_path: Path) -> None:
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (tmp_path / "api").mkdir()
+    (tmp_path / "secret").mkdir()
+    (extra / "worker").mkdir()
+    settings = make_settings(
+        tmp_path,
+        additional_project_directories=[extra],
+        project_ignore_names=["secret"],
+    )
+    service = ProjectService(settings, noop_record_event)
+    context = SimpleNamespace(user_data={})
+
+    options, truncated = service.list_repo_options(context)
+
+    assert truncated is False
+    assert [option.label for option in options] == [
+        str((tmp_path / "api").resolve()),
+        str((extra / "worker").resolve()),
+    ]
+    assert all(option.key.startswith("/") for option in options)
+
+
+def test_list_repo_options_respects_visible_names(tmp_path: Path) -> None:
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (tmp_path / "api").mkdir()
+    (tmp_path / "web").mkdir()
+    (extra / "worker").mkdir()
+    settings = make_settings(
+        tmp_path,
+        additional_project_directories=[extra],
+        project_visible_names=["worker", "api"],
+    )
+    service = ProjectService(settings, noop_record_event)
+
+    options, _ = service.list_repo_options(SimpleNamespace(user_data={}))
+
+    assert [option.label for option in options] == [
+        str((tmp_path / "api").resolve()),
+        str((extra / "worker").resolve()),
+    ]
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,8 @@ from pathlib import Path
 
 from .config import Settings
 from .models import ProjectRun
+from .services.projects import ProjectService
+from .telegram.ui.texts import render_project_display_name
 
 
 def _format_duration(run: ProjectRun) -> str:
@@ -48,6 +50,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     settings = Settings()
+    project_service = ProjectService(settings, _noop_record_event)
     _ensure_schema(settings.sqlite_path)
     conn = sqlite3.connect(settings.sqlite_path)
     conn.row_factory = sqlite3.Row
@@ -55,7 +58,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
         user_id = settings.allowed_users[0] if settings.allowed_users else 0
         if args.entity == "workspace":
             if args.project:
-                project_path = str((settings.approved_directory / args.project).resolve())
+                project_path = str(project_service.resolve_repo_slug(args.project).resolve())
                 rows = conn.execute(
                     """
                     SELECT run_id, project_path, thread_id, status, started_at, finished_at, last_update_at
@@ -78,9 +81,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 (user_id,),
             ).fetchone()
             current_project = str(current_row["current_project_path"]) if current_row else ""
-            for path in sorted(settings.approved_directory.iterdir()):
-                if not path.is_dir() or path.name.startswith("."):
-                    continue
+            for path in project_service.list_project_paths():
                 row = conn.execute(
                     """
                     SELECT run_id, project_path, thread_id, status, started_at, finished_at, last_update_at
@@ -92,10 +93,12 @@ def _run_sync(argv: list[str] | None = None) -> int:
                     (user_id, str(path.resolve())),
                 ).fetchone()
                 run = _row_to_run(row) if row else None
-                status = run.status.value if run else "idle"
-                duration = _format_duration(run) if run else "-"
+                if run is None:
+                    continue
+                status = run.status.value
+                duration = _format_duration(run)
                 marker = "*" if str(path.resolve()) == current_project else "-"
-                print(f"{marker} {path.name}: {status} {duration}")
+                print(f"{marker} {project_service.render_project_label(path)}: {status} {duration}")
             return 0
         if args.entity == "run":
             row = conn.execute(
@@ -113,7 +116,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
             run = _row_to_run(row)
             if args.action == "show":
                 print(f"run_id={run.run_id}")
-                print(f"project={Path(run.project_path).name}")
+                print(f"project={render_project_display_name(Path(run.project_path))}")
                 print(f"status={run.status.value}")
                 print(f"thread_id={run.thread_id or 'none'}")
                 print(f"duration={_format_duration(run)}")
@@ -144,7 +147,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                     (user_id, run.project_path),
                 )
                 conn.commit()
-                print(f"Attached {run.thread_id[:8]} to {Path(run.project_path).name}")
+                print(f"Attached {run.thread_id[:8]} to {render_project_display_name(Path(run.project_path))}")
                 return 0
             if args.action == "stop":
                 if not run.is_active:
@@ -158,8 +161,9 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 print(f"Stop requested for run {run.run_id}")
                 return 0
         if args.entity == "project" and args.action == "switch":
-            project_path = (settings.approved_directory / args.slug).resolve()
-            if not project_path.exists() or not project_path.is_dir():
+            try:
+                project_path = project_service.resolve_repo_slug(args.slug)
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
                 print("Project not found")
                 return 1
             conn.execute(
@@ -260,6 +264,10 @@ def _ensure_schema(db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+async def _noop_record_event(*args, **kwargs) -> None:
+    return None
 
 
 def run(argv: list[str] | None = None) -> int:

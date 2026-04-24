@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     telegram_bot_username: str
 
     approved_directory: Path
+    additional_project_directories: Annotated[list[Path], NoDecode] = Field(default_factory=list)
+    project_visible_names: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    project_ignore_names: Annotated[list[str], NoDecode] = Field(default_factory=list)
     allowed_users: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     database_url: str = "sqlite:///./codex_telegram_bot.db"
@@ -83,6 +86,46 @@ class Settings(BaseSettings):
             return [int(x.strip()) for x in normalized.split(",") if x.strip()]
         return value
 
+    @field_validator("additional_project_directories", mode="before")
+    @classmethod
+    def parse_additional_project_directories(cls, value):
+        if value is None or value == "":
+            return []
+        if isinstance(value, Path):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [Path(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return []
+            if normalized.startswith("[") and normalized.endswith("]"):
+                parsed = json.loads(normalized)
+                if isinstance(parsed, list):
+                    return [Path(item) for item in parsed if str(item).strip()]
+                return [Path(parsed)]
+            return [Path(item.strip()) for item in normalized.split(",") if item.strip()]
+        return value
+
+    @field_validator("project_visible_names", "project_ignore_names", mode="before")
+    @classmethod
+    def parse_project_name_filters(cls, value):
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return []
+            if normalized.startswith("[") and normalized.endswith("]"):
+                parsed = json.loads(normalized)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+                return [str(parsed).strip()]
+            return [item.strip() for item in normalized.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return value
+
     @field_validator("approved_directory")
     @classmethod
     def validate_approved_directory(cls, value: Path) -> Path:
@@ -90,6 +133,22 @@ class Settings(BaseSettings):
         if not path.exists() or not path.is_dir():
             raise ValueError(f"APPROVED_DIRECTORY must exist and be a directory: {path}")
         return path
+
+    @field_validator("additional_project_directories")
+    @classmethod
+    def validate_additional_project_directories(cls, value: list[Path]) -> list[Path]:
+        resolved_paths: list[Path] = []
+        seen: set[Path] = set()
+        for item in value:
+            path = Path(item).expanduser().resolve()
+            if not path.exists() or not path.is_dir():
+                raise ValueError(
+                    f"ADDITIONAL_PROJECT_DIRECTORIES entries must exist and be directories: {path}"
+                )
+            if path not in seen:
+                resolved_paths.append(path)
+                seen.add(path)
+        return resolved_paths
 
     @field_validator("voice_provider", mode="before")
     @classmethod

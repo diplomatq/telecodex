@@ -40,6 +40,7 @@ from ..telegram.ui.texts import (
     render_status_text,
     render_verbose_text,
     render_workspace_text,
+    render_project_display_name,
 )
 
 
@@ -301,7 +302,7 @@ class NavigationFlow:
 
         cwd = project.path
         await self.session_store.clear_session(update.effective_user.id, str(cwd))
-        notice = f"Новая сессия для `{cwd.name}` готова."
+        notice = f"Новая сессия для `{render_project_display_name(cwd)}` готова."
         await self.show_menu(update, context, request_context, edit=edit, notice=notice)
 
     async def show_status(
@@ -423,7 +424,6 @@ class NavigationFlow:
         command_text: str,
     ) -> None:
         args = command_text.split()[1:]
-        base = self.settings.approved_directory.resolve()
         if args and args[0] == "new":
             if len(args) < 2:
                 await update.effective_message.reply_text(
@@ -453,11 +453,11 @@ class NavigationFlow:
             )
             return
         if args:
-            candidate = (base / args[0]).resolve()
-            self.projects.ensure_in_workspace(candidate)
-            if not candidate.exists() or not candidate.is_dir():
+            try:
+                candidate = self.projects.resolve_repo_slug(args[0])
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
                 await update.effective_message.reply_text(
-                    f"Проект не найден: `{candidate.name}`",
+                    f"Проект не найден: `{args[0]}`",
                     reply_markup=build_navigation_keyboard(),
                     parse_mode="Markdown",
                 )
@@ -468,7 +468,7 @@ class NavigationFlow:
                 update,
                 context,
                 request_context,
-                notice=render_project_selected_text(candidate, base),
+                notice=render_project_selected_text(candidate, candidate.parent),
             )
             return
 
@@ -598,7 +598,7 @@ class NavigationFlow:
         edit: bool = True,
         notice: str = "",
     ) -> None:
-        project_path = self.projects.resolve_repo_slug(project_slug)
+        project_path = self.projects.resolve_repo_key(project_slug)
         runs = await self.session_store.list_project_runs(
             user_id=update.effective_user.id,
             project_path=str(project_path),
@@ -609,7 +609,7 @@ class NavigationFlow:
             str(project_path),
         )
         text = render_project_runs_text(
-            project_name=project_path.name,
+            project_name=render_project_display_name(project_path),
             runs=runs,
             current_thread_id=current_thread_id or "",
             notice=notice,
@@ -702,7 +702,7 @@ class NavigationFlow:
             request_context,
             run_id,
             edit=True,
-            notice=f"Сессия `{run.thread_id[:8]}` выбрана для проекта `{project_path.name}`.",
+            notice=f"Сессия `{run.thread_id[:8]}` выбрана для проекта `{render_project_display_name(project_path)}`.",
         )
 
     async def select_repo_from_callback(
@@ -720,7 +720,7 @@ class NavigationFlow:
         )
         previous_dir = current_resolution.path or self.settings.approved_directory.resolve()
         try:
-            selected_dir = self.projects.resolve_repo_slug(slug)
+            selected_dir = self.projects.resolve_repo_key(slug)
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             await query.answer("Project unavailable.", show_alert=True)
             options, truncated = self.projects.list_repo_options(context)
@@ -746,7 +746,7 @@ class NavigationFlow:
             context,
             request_context,
             edit=True,
-            notice=render_project_selected_text(selected_dir, self.settings.approved_directory),
+            notice=render_project_selected_text(selected_dir, selected_dir.parent),
         )
 
     async def quick_select_repo_from_menu(
@@ -764,7 +764,7 @@ class NavigationFlow:
         )
         previous_dir = current_resolution.path or self.settings.approved_directory.resolve()
         try:
-            selected_dir = self.projects.resolve_repo_slug(slug)
+            selected_dir = self.projects.resolve_repo_key(slug)
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             await query.answer("Проект недоступен.", show_alert=True)
             await self.show_menu(
@@ -792,5 +792,5 @@ class NavigationFlow:
             context,
             request_context,
             edit=True,
-            notice=render_project_selected_text(selected_dir, self.settings.approved_directory),
+            notice=render_project_selected_text(selected_dir, selected_dir.parent),
         )

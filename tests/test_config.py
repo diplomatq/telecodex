@@ -163,6 +163,28 @@ def test_settings_validate_approved_directory(tmp_path: Path) -> None:
         make_settings(tmp_path, approved_directory=missing)
 
 
+def test_settings_parse_additional_project_directories_and_filters(tmp_path: Path) -> None:
+    extra = tmp_path / "extra"
+    extra.mkdir()
+
+    settings = make_settings(
+        tmp_path,
+        additional_project_directories=f"{extra}",
+        project_visible_names="api, web",
+        project_ignore_names='["secret"]',
+    )
+
+    assert settings.additional_project_directories == [extra.resolve()]
+    assert settings.project_visible_names == ["api", "web"]
+    assert settings.project_ignore_names == ["secret"]
+
+
+def test_settings_validate_additional_project_directories(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-extra"
+    with pytest.raises(ValueError, match="ADDITIONAL_PROJECT_DIRECTORIES"):
+        make_settings(tmp_path, additional_project_directories=[missing])
+
+
 def test_settings_validate_openai_compatible_voice_provider(tmp_path: Path) -> None:
     settings = make_settings(
         tmp_path,

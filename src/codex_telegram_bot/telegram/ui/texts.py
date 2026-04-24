@@ -17,6 +17,13 @@ from ...services.status_line import CodexLimitStatus, StatusLineRenderer
 from ...services.projects import RepoOption
 
 
+def render_project_display_name(path: Optional[Path]) -> str:
+    if path is None:
+        return "не выбран"
+    resolved = path.resolve()
+    return str(resolved.parent / resolved.name)
+
+
 def render_launch_mode_label(launch_mode: CodexLaunchMode) -> str:
     if launch_mode == CodexLaunchMode.FULL_ACCESS:
         return "Полный доступ"
@@ -24,7 +31,7 @@ def render_launch_mode_label(launch_mode: CodexLaunchMode) -> str:
 
 
 def render_project_header(cwd: Optional[Path]) -> str:
-    project_name = cwd.name if cwd is not None else "не выбран"
+    project_name = render_project_display_name(cwd)
     return f"Проект: `{project_name}`"
 
 
@@ -90,11 +97,11 @@ def render_home_text(cwd: Optional[Path], *, auto_created: bool = False) -> str:
             "Проект: `не выбран`\n"
             "Выбери существующий проект или создай новый."
         )
-    created_line = f"Автоматически создал первый проект: `{cwd.name}`.\n\n" if auto_created else ""
+    created_line = f"Автоматически создал первый проект: `{render_project_display_name(cwd)}`.\n\n" if auto_created else ""
     return (
         "Быстрый доступ.\n\n"
         f"{created_line}"
-        f"Проект: `{cwd.name}`\n"
+        f"Проект: `{render_project_display_name(cwd)}`\n"
         "Отправь задачу или выбери действие ниже."
     )
 
@@ -110,10 +117,10 @@ def render_start_chat_text(
             "Проект: `не выбран`\n\n"
             "Сначала создай новый проект или выбери существующий."
         )
-    created_line = f"Автоматически создал первый проект: `{cwd.name}`.\n\n" if auto_created else ""
+    created_line = f"Автоматически создал первый проект: `{render_project_display_name(cwd)}`.\n\n" if auto_created else ""
     return (
         f"{created_line}"
-        f"Проект: `{cwd.name}`\n"
+        f"Проект: `{render_project_display_name(cwd)}`\n"
         f"Режим: `{render_launch_mode_label(launch_mode)}`\n\n"
         "Отправь задачу сообщением."
     )
@@ -133,12 +140,12 @@ def render_status_text(
 ) -> str:
     lines = []
     if auto_created and cwd is not None:
-        lines.append(f"Автоматически выбран проект: `{cwd.name}`")
+        lines.append(f"Автоматически выбран проект: `{render_project_display_name(cwd)}`")
     lines.extend(
         [
             "Статус.",
             "",
-            f"Проект: `{cwd.name if cwd is not None else 'не выбран'}`",
+            f"Проект: `{render_project_display_name(cwd)}`",
             f"Путь: `{cwd if cwd is not None else settings.approved_directory.resolve()}`",
             f"Thread ID: `{session.thread_id if session else 'none'}`",
             f"Режим: `{render_launch_mode_label(launch_mode)}`",
@@ -178,13 +185,13 @@ def render_session_text(
         lines.append(notice)
         lines.append("")
     if auto_created:
-        lines.append(f"Автоматически создал первый проект: `{cwd.name}`.")
+        lines.append(f"Автоматически создал первый проект: `{render_project_display_name(cwd)}`.")
         lines.append("")
     lines.extend(
         [
             "Быстрый доступ.",
             "",
-            f"Проект: `{cwd.name}`",
+            f"Проект: `{render_project_display_name(cwd)}`",
             f"Режим: `{render_launch_mode_label(launch_mode)}`",
             f"Сессия: `{'текущая' if has_session else 'новая'}`",
         ]
@@ -219,7 +226,7 @@ def render_local_sessions_text(
         [
             "Сессии.",
             "",
-            f"Проект: `{cwd.name}`",
+            f"Проект: `{render_project_display_name(cwd)}`",
             f"Текущая: `{current_thread_id or 'none'}`",
             "",
         ]
@@ -297,12 +304,12 @@ def render_repo_picker_text(
 
 
 def render_project_selected_text(selected_dir: Path, base_dir: Path) -> str:
-    relative = selected_dir.resolve().relative_to(base_dir.resolve())
-    return f"Текущий проект: `{relative}`."
+    del base_dir
+    return f"Текущий проект: `{render_project_display_name(selected_dir)}`."
 
 
 def render_project_created_text(project: Path) -> str:
-    return f"Новый проект: `{project.name}`."
+    return f"Новый проект: `{render_project_display_name(project)}`."
 
 
 def render_no_projects_text() -> str:
@@ -399,19 +406,22 @@ def render_workspace_text(
     if not summaries:
         lines.append("Проекты не найдены.")
         return "\n".join(lines)
-    for summary in summaries:
+    visible_summaries = [summary for summary in summaries if (summary.active_run or summary.latest_run) is not None]
+    if not visible_summaries:
+        lines.append("Нет активных или завершённых процессов.")
+        return "\n".join(lines)
+    for summary in visible_summaries:
         marker = "•"
         if summary.is_current:
             marker = "▶"
         run = summary.active_run or summary.latest_run
-        status = run.status.value if run else "idle"
+        status = run.status.value
         lines.append(f"{marker} `{summary.project_name}` · `{status}`")
-        if run is not None:
-            lines.append(
-                f"длительность `{_format_run_duration(run)}` · обновление `{_format_last_update(run)}` назад"
-            )
-            if run.last_progress_summary:
-                lines.append(run.last_progress_summary[:120])
+        lines.append(
+            f"длительность `{_format_run_duration(run)}` · обновление `{_format_last_update(run)}` назад"
+        )
+        if run.last_progress_summary:
+            lines.append(run.last_progress_summary[:120])
         if summary.current_session_thread_id:
             lines.append(f"сессия `{summary.current_session_thread_id[:8]}`")
         if summary.recent_run_count:
@@ -463,7 +473,7 @@ def render_run_detail_text(
         [
             "Карточка процесса.",
             "",
-            f"Проект: `{Path(run.project_path).name}`",
+            f"Проект: `{render_project_display_name(Path(run.project_path))}`",
             f"Run ID: `{run.run_id}`",
             f"Статус: `{run.status.value}`",
             f"Thread ID: `{run.thread_id or 'none'}`",

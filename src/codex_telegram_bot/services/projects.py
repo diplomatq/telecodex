@@ -17,6 +17,7 @@ RecordEvent = Callable[..., Awaitable[None]]
 
 @dataclass(frozen=True)
 class RepoOption:
+    key: str
     slug: str
     label: str
     is_current: bool = False
@@ -24,6 +25,7 @@ class RepoOption:
 
 @dataclass(frozen=True)
 class RecentProjectOption:
+    key: str
     slug: str
     label: str
     is_current: bool = False
@@ -59,7 +61,7 @@ class ProjectService:
             try:
                 current_path = Path(current).resolve()
                 self.ensure_in_workspace(current_path)
-                if current_path.exists() and current_path.is_dir() and current_path.parent == root:
+                if self._is_selectable_project_path(current_path):
                     return ProjectResolution(path=current_path)
             except Exception:
                 pass
@@ -82,11 +84,14 @@ class ProjectService:
         return ProjectResolution(path=None)
 
     def ensure_in_workspace(self, path: Path) -> None:
-        root = self.settings.approved_directory.resolve()
-        try:
-            path.resolve().relative_to(root)
-        except ValueError as exc:
-            raise PermissionError(f"Path outside approved directory: {path}") from exc
+        candidate = path.resolve()
+        for root in self.project_roots:
+            try:
+                candidate.relative_to(root)
+                return
+            except ValueError:
+                continue
+        raise PermissionError(f"Path outside approved directory: {path}")
 
     def list_repo_options(self, context: ContextTypes.DEFAULT_TYPE) -> tuple[list[RepoOption], bool]:
         current = context.user_data.get("current_directory")
@@ -95,8 +100,9 @@ class ProjectService:
         truncated = len(entries) > 20
         options = [
             RepoOption(
+                key=self.path_to_key(entry),
                 slug=entry.name,
-                label=entry.name,
+                label=self.render_project_label(entry),
                 is_current=current_path is not None and entry == current_path,
             )
             for entry in entries[:20]
@@ -104,20 +110,44 @@ class ProjectService:
         return options, truncated
 
     def resolve_repo_slug(self, slug: str) -> Path:
-        base = self.settings.approved_directory.resolve()
-        candidate = (base / slug).resolve()
+        candidates = [path for path in self.list_project_paths() if path.name == slug]
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise FileNotFoundError(slug)
+        raise PermissionError(slug)
+
+    def resolve_repo_key(self, key: str) -> Path:
+        candidate = Path(key).expanduser().resolve()
         self.ensure_in_workspace(candidate)
         if not candidate.exists():
-            raise FileNotFoundError(slug)
+            raise FileNotFoundError(key)
         if not candidate.is_dir():
-            raise NotADirectoryError(slug)
-        if candidate.parent != base:
-            raise PermissionError(slug)
+            raise NotADirectoryError(key)
+        if not self._is_selectable_project_path(candidate):
+            raise PermissionError(key)
         return candidate
 
     def list_project_paths(self) -> list[Path]:
-        base = self.settings.approved_directory.resolve()
-        return [p for p in sorted(base.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+        visible_names = {name.strip() for name in self.settings.project_visible_names if name.strip()}
+        ignored_names = {name.strip() for name in self.settings.project_ignore_names if name.strip()}
+        entries: list[Path] = []
+        primary_root = self.settings.approved_directory.resolve()
+        for root in self.project_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in sorted(root.iterdir()):
+                if not path.is_dir() or path.name.startswith("."):
+                    continue
+                if root == primary_root and path in self.settings.additional_project_directories:
+                    continue
+                if path.name in ignored_names:
+                    continue
+                if visible_names and path.name not in visible_names:
+                    continue
+                entries.append(path.resolve())
+        entries.sort(key=lambda item: (self.render_project_label(item), str(item)))
+        return entries
 
     def list_project_path_strings(self) -> list[str]:
         return [str(path.resolve()) for path in self.list_project_paths()]
@@ -142,8 +172,9 @@ class ProjectService:
         )
         return [
             RecentProjectOption(
+                key=self.path_to_key(available_path_map[path]),
                 slug=available_path_map[path].name,
-                label=available_path_map[path].name,
+                label=self.render_project_label(available_path_map[path]),
                 is_current=current_project_path is not None and available_path_map[path] == current_project_path,
             )
             for path in recent_paths
@@ -164,6 +195,54 @@ class ProjectService:
                 f"{self.settings.sqlite_path.name}-shm",
             }:
                 continue
+            return False
+        return True
+
+    @property
+    def project_roots(self) -> list[Path]:
+        roots = [self.settings.approved_directory.resolve(), *self.settings.additional_project_directories]
+        resolved: list[Path] = []
+        seen: set[Path] = set()
+        for root in roots:
+            path = Path(root).expanduser().resolve()
+            if path not in seen:
+                resolved.append(path)
+                seen.add(path)
+        return resolved
+
+    def render_project_label(self, path: Path) -> str:
+        return str(path.resolve())
+
+    def path_to_key(self, path: Path) -> str:
+        return str(path.resolve())
+
+    def _find_project_root(self, path: Path) -> Optional[Path]:
+        resolved = path.resolve()
+        matching_roots: list[Path] = []
+        for root in self.project_roots:
+            try:
+                resolved.relative_to(root)
+                matching_roots.append(root)
+            except ValueError:
+                continue
+        if not matching_roots:
+            return None
+        return max(matching_roots, key=lambda item: len(item.parts))
+
+    def _is_selectable_project_path(self, path: Path) -> bool:
+        resolved = path.resolve()
+        root = self._find_project_root(resolved)
+        if root is None:
+            return False
+        if not resolved.exists() or not resolved.is_dir():
+            return False
+        if resolved.parent != root:
+            return False
+        visible_names = {name.strip() for name in self.settings.project_visible_names if name.strip()}
+        ignored_names = {name.strip() for name in self.settings.project_ignore_names if name.strip()}
+        if resolved.name in ignored_names:
+            return False
+        if visible_names and resolved.name not in visible_names:
             return False
         return True
 
@@ -256,9 +335,8 @@ class ProjectService:
             return None
         try:
             remembered_path = Path(remembered).resolve()
-            root = self.settings.approved_directory.resolve()
             self.ensure_in_workspace(remembered_path)
-            if remembered_path.exists() and remembered_path.is_dir() and remembered_path.parent == root:
+            if self._is_selectable_project_path(remembered_path):
                 return remembered_path
         except Exception:
             return None
