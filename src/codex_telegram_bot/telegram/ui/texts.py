@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from ...config import Settings
-from ...models import CodexLaunchMode, CodexResponse, CodexResultStatus
+from ...models import (
+    CodexLaunchMode,
+    CodexResponse,
+    CodexResultStatus,
+    LocalCodexSession,
+    ProjectActivitySummary,
+    ProjectRun,
+)
+from ...services.status_line import CodexLimitStatus, StatusLineRenderer
 from ...services.projects import RepoOption
 
 
@@ -14,19 +23,79 @@ def render_launch_mode_label(launch_mode: CodexLaunchMode) -> str:
     return "Песочница"
 
 
+def render_project_header(cwd: Optional[Path]) -> str:
+    project_name = cwd.name if cwd is not None else "не выбран"
+    return f"Проект: `{project_name}`"
+
+
+def render_model_label(settings: Settings) -> str:
+    model = settings.codex_model or "default"
+    if settings.codex_reasoning_effort:
+        return f"{model} {settings.codex_reasoning_effort}"
+    return model
+
+
+def render_runtime_footer(
+    settings: Settings,
+    response: Optional[CodexResponse] = None,
+    *,
+    include_token_summary: bool = True,
+    cwd: Optional[Path] = None,
+    thread_id: str = "",
+    launch_mode: Optional[CodexLaunchMode | str] = None,
+    limits: Optional[CodexLimitStatus] = None,
+) -> str:
+    return StatusLineRenderer(settings).render(
+        cwd=cwd,
+        response=response,
+        thread_id=thread_id,
+        launch_mode=launch_mode,
+        limits=limits,
+        include_token_summary=include_token_summary,
+    )
+
+
+def wrap_project_message(
+    text: str,
+    *,
+    cwd: Optional[Path],
+    settings: Settings,
+    response: Optional[CodexResponse] = None,
+    include_footer: bool = True,
+    include_token_summary: bool = True,
+    thread_id: str = "",
+    launch_mode: Optional[CodexLaunchMode | str] = None,
+    status_line_limits: Optional[CodexLimitStatus] = None,
+) -> str:
+    parts = [render_project_header(cwd), text]
+    if include_footer:
+        parts.append(
+            render_runtime_footer(
+                settings,
+                response,
+                include_token_summary=include_token_summary,
+                cwd=cwd,
+                thread_id=thread_id,
+                launch_mode=launch_mode,
+                limits=status_line_limits,
+            )
+        )
+    return "\n\n".join(part for part in parts if part)
+
+
 def render_home_text(cwd: Optional[Path], *, auto_created: bool = False) -> str:
     if cwd is None:
         return (
-            "Codex Telegram Bot для работы с кодом прямо из чата.\n\n"
-            "Проект ещё не выбран.\n"
-            "Открой `/menu` или используй `➕ Создать проект`, чтобы начать."
+            "Быстрый доступ.\n\n"
+            "Проект: `не выбран`\n"
+            "Выбери существующий проект или создай новый."
         )
     created_line = f"Автоматически создал первый проект: `{cwd.name}`.\n\n" if auto_created else ""
     return (
-        "Codex Telegram Bot для работы с кодом прямо из чата.\n\n"
+        "Быстрый доступ.\n\n"
         f"{created_line}"
-        f"Текущий проект: `{cwd.name}`\n\n"
-        "Отправь задачу сообщением или открой `/menu`, чтобы сменить проект, режим доступа или начать новую сессию."
+        f"Проект: `{cwd.name}`\n"
+        "Отправь задачу или выбери действие ниже."
     )
 
 
@@ -38,16 +107,15 @@ def render_start_chat_text(
 ) -> str:
     if cwd is None:
         return (
-            "Сейчас проект не выбран.\n\n"
-            "Сначала создай новую рабочую папку кнопкой `➕ Создать проект`."
+            "Проект: `не выбран`\n\n"
+            "Сначала создай новый проект или выбери существующий."
         )
     created_line = f"Автоматически создал первый проект: `{cwd.name}`.\n\n" if auto_created else ""
     return (
         f"{created_line}"
-        f"Готов к работе в проекте `{cwd.name}`.\n\n"
-        f"Режим доступа: `{render_launch_mode_label(launch_mode)}`.\n\n"
-        "Отправь задачу сообщением.\n"
-        "Если нужно изменить проект или режим, открой `/menu`."
+        f"Проект: `{cwd.name}`\n"
+        f"Режим: `{render_launch_mode_label(launch_mode)}`\n\n"
+        "Отправь задачу сообщением."
     )
 
 
@@ -59,25 +127,37 @@ def render_status_text(
     *,
     auto_created: bool = False,
     launch_mode: CodexLaunchMode = CodexLaunchMode.SANDBOX,
+    has_active_run: bool = False,
+    active_run_count: int = 0,
+    active_run_limit: int = 0,
 ) -> str:
     lines = []
     if auto_created and cwd is not None:
-        lines.append(f"Автоматически созданный проект: `{cwd.name}`")
+        lines.append(f"Автоматически выбран проект: `{cwd.name}`")
     lines.extend(
         [
+            "Статус.",
+            "",
             f"Проект: `{cwd.name if cwd is not None else 'не выбран'}`",
             f"Путь: `{cwd if cwd is not None else settings.approved_directory.resolve()}`",
             f"Thread ID: `{session.thread_id if session else 'none'}`",
-            f"Режим доступа: `{render_launch_mode_label(launch_mode)}`",
+            f"Режим: `{render_launch_mode_label(launch_mode)}`",
+            f"Модель: `{render_model_label(settings)}`",
             f"Verbose: `{verbose_level}`",
         ]
     )
+    if has_active_run:
+        lines.append("Запуск: `выполняется`")
+    if active_run_count:
+        lines.append(f"Активных процессов: `{active_run_count}`")
+    if active_run_limit and active_run_count >= active_run_limit:
+        lines.append(f"Лимит новых запусков: `{active_run_count}/{active_run_limit}`")
     if session and session.last_status:
         lines.append(f"Последний статус: `{session.last_status}`")
     if session and session.last_error:
         lines.append(f"Последняя ошибка: `{session.last_error[:160]}`")
     if cwd is None:
-        lines.append("Сначала выбери или создай проект.")
+        lines.append("Выбери проект или создай новый.")
     return "\n".join(lines)
 
 
@@ -87,6 +167,9 @@ def render_session_text(
     launch_mode: CodexLaunchMode,
     has_session: bool,
     has_active_run: bool,
+    recent_project_count: int = 0,
+    active_run_count: int = 0,
+    active_run_limit: int = 0,
     auto_created: bool = False,
     notice: str = "",
 ) -> str:
@@ -99,15 +182,59 @@ def render_session_text(
         lines.append("")
     lines.extend(
         [
-            "Текущая сессия.",
+            "Быстрый доступ.",
             "",
             f"Проект: `{cwd.name}`",
-            f"Режим доступа: `{render_launch_mode_label(launch_mode)}`",
+            f"Режим: `{render_launch_mode_label(launch_mode)}`",
             f"Сессия: `{'текущая' if has_session else 'новая'}`",
         ]
     )
     if has_active_run:
         lines.append("Запуск: `выполняется`")
+    else:
+        lines.append("Выбери действие ниже или отправь задачу сообщением.")
+    if recent_project_count >= 2:
+        lines.append("Недавние: переключение в один тап.")
+    if active_run_count:
+        lines.append(f"Активных процессов: `{active_run_count}`")
+    if active_run_limit and active_run_count >= active_run_limit:
+        lines.append(f"Новые запуски временно недоступны: `{active_run_count}/{active_run_limit}`")
+    return "\n".join(lines)
+
+
+def render_local_sessions_text(
+    *,
+    cwd: Path,
+    sessions: list[LocalCodexSession],
+    current_thread_id: str = "",
+    has_active_run: bool = False,
+    active_run_count: int = 0,
+    active_run_limit: int = 0,
+    notice: str = "",
+) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(
+        [
+            "Сессии.",
+            "",
+            f"Проект: `{cwd.name}`",
+            f"Текущая: `{current_thread_id or 'none'}`",
+            "",
+        ]
+    )
+    if sessions:
+        lines.append("Выбери локальную сессию для продолжения.")
+        lines.append(f"Показаны последние `{len(sessions)}`.")
+    else:
+        lines.append("Локальные сессии не найдены.")
+    if has_active_run:
+        lines.extend(["", "Сначала дождись завершения или останови текущий запуск."])
+    elif active_run_count:
+        lines.extend(["", f"Активных процессов у пользователя: `{active_run_count}`."])
+    if active_run_limit and active_run_count >= active_run_limit:
+        lines.append(f"Лимит новых запусков достигнут: `{active_run_count}/{active_run_limit}`.")
     return "\n".join(lines)
 
 
@@ -120,38 +247,68 @@ def render_verbose_text(current_level: int) -> str:
     )
 
 
+def _format_relative_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _format_run_duration(run: ProjectRun, *, now: Optional[datetime] = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    started_at = run.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    end = run.finished_at or current
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return _format_relative_duration(max(int((end - started_at).total_seconds()), 0))
+
+
+def _format_last_update(run: ProjectRun, *, now: Optional[datetime] = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    last_update = run.last_update_at
+    if last_update.tzinfo is None:
+        last_update = last_update.replace(tzinfo=timezone.utc)
+    delta_seconds = max(int((current - last_update).total_seconds()), 0)
+    return _format_relative_duration(delta_seconds)
+
+
 def render_repo_picker_text(
     entries: list[RepoOption],
     truncated: bool,
     *,
     auto_created: bool = False,
 ) -> str:
-    text = "Выбери активный проект. Codex будет запускаться в этой директории."
+    text = "Проекты.\n\nВыбери активный проект."
     if auto_created:
         current_created = next((entry.slug for entry in entries if entry.is_current), "")
         if current_created:
-            text = f"Создал первый проект `{current_created}`.\n\n" + text
+            text = f"Создан первый проект `{current_created}`.\n\n" + text
     if truncated:
-        text += "\n\nПоказаны первые 20 подпроектов."
+        text += "\n\nПоказаны первые 20 проектов."
     current = next((entry.slug for entry in entries if entry.is_current), "")
     if current:
-        text += f"\n\nТекущий проект: `{current}`"
+        text += f"\n\nТекущий: `{current}`"
     return text
 
 
 def render_project_selected_text(selected_dir: Path, base_dir: Path) -> str:
     relative = selected_dir.resolve().relative_to(base_dir.resolve())
-    return f"Активный проект переключён на `{relative}`."
+    return f"Текущий проект: `{relative}`."
 
 
 def render_project_created_text(project: Path) -> str:
-    return f"Создал и выбрал новый проект: `{project.name}`."
+    return f"Новый проект: `{project.name}`."
 
 
 def render_no_projects_text() -> str:
     return (
-        "В рабочем каталоге пока нет проектов.\n\n"
-        "Нажми `➕ Создать проект`, чтобы создать новую подпапку-проект."
+        "Проекты не найдены.\n\n"
+        "Создай новый проект или открой список."
     )
 
 
@@ -174,8 +331,15 @@ def render_final_text(response: CodexResponse) -> str:
     return response.final_text or f"Request failed: {response.error_message}"
 
 
-def build_progress_text(elapsed_seconds: int, last_progress_lines: list[str]) -> str:
+def build_progress_text(
+    elapsed_seconds: int,
+    last_progress_lines: list[str],
+    *,
+    project_name: str = "",
+) -> str:
     header = f"Working... {elapsed_seconds}s"
+    if project_name:
+        header = f"Проект: {project_name}\n\n{header}"
     if not last_progress_lines:
         return header
     return header + "\n\n" + "\n".join(last_progress_lines)
@@ -193,16 +357,16 @@ def render_launch_mode_editor_text(
         lines.extend([notice, ""])
     lines.extend(
         [
-            "Настройка режима доступа.",
+            "Режим доступа.",
             "",
             f"Проект: `{project_name}`",
-            f"Текущий режим: `{render_launch_mode_label(launch_mode)}`",
+            f"Текущий: `{render_launch_mode_label(launch_mode)}`",
             "",
-            "Новый режим будет применяться ко всем следующим запросам в этом проекте.",
+            "Изменение применится к следующему запросу.",
         ]
     )
     if has_active_run:
-        lines.append("Текущий запуск не изменится. Новый режим применится к следующему запросу.")
+        lines.append("Текущий запуск не изменится.")
     return "\n".join(lines)
 
 
@@ -210,6 +374,113 @@ def render_full_access_warning_text(*, project_name: str) -> str:
     return (
         "Подтверждение полного доступа.\n\n"
         f"Проект: `{project_name}`\n\n"
-        "Полный доступ отключает sandbox для следующих запросов в этом проекте.\n"
-        "Codex сможет выполнять команды и работать с файлами без ограничений песочницы."
+        "Следующие запросы будут выполняться без sandbox.\n"
+        "Используй этот режим только когда нужен доступ без ограничений."
     )
+
+
+def render_workspace_text(
+    summaries: list[ProjectActivitySummary],
+    *,
+    notice: str = "",
+    active_run_count: int = 0,
+    active_run_limit: int = 0,
+) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(["Сводка по проектам.", ""])
+    if active_run_count:
+        lines.append(f"Активных процессов: `{active_run_count}`")
+    if active_run_limit and active_run_count >= active_run_limit:
+        lines.append(f"Новые запуски временно недоступны: `{active_run_count}/{active_run_limit}`")
+    if active_run_count or (active_run_limit and active_run_count >= active_run_limit):
+        lines.append("")
+    if not summaries:
+        lines.append("Проекты не найдены.")
+        return "\n".join(lines)
+    for summary in summaries:
+        marker = "•"
+        if summary.is_current:
+            marker = "▶"
+        run = summary.active_run or summary.latest_run
+        status = run.status.value if run else "idle"
+        lines.append(f"{marker} `{summary.project_name}` · `{status}`")
+        if run is not None:
+            lines.append(
+                f"длительность `{_format_run_duration(run)}` · обновление `{_format_last_update(run)}` назад"
+            )
+            if run.last_progress_summary:
+                lines.append(run.last_progress_summary[:120])
+        if summary.current_session_thread_id:
+            lines.append(f"сессия `{summary.current_session_thread_id[:8]}`")
+        if summary.recent_run_count:
+            lines.append(f"запусков в списке: `{summary.recent_run_count}`")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_project_runs_text(
+    *,
+    project_name: str,
+    runs: list[ProjectRun],
+    current_thread_id: str = "",
+    notice: str = "",
+) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(["Фоновые процессы.", "", f"Проект: `{project_name}`"])
+    if current_thread_id:
+        lines.append(f"Текущая сессия: `{current_thread_id}`")
+    lines.append("")
+    if not runs:
+        lines.append("Запусков пока нет.")
+        return "\n".join(lines)
+    for run in runs:
+        lines.append(
+            f"#{run.run_id} · `{run.status.value}` · `{_format_run_duration(run)}` · thread `{(run.thread_id or 'none')[:8]}`"
+        )
+        if run.last_progress_summary:
+            lines.append(run.last_progress_summary[:120])
+        elif run.first_prompt_preview:
+            lines.append(run.first_prompt_preview[:120])
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_run_detail_text(
+    run: ProjectRun,
+    *,
+    current_session_thread_id: str = "",
+    is_current_project: bool = False,
+    notice: str = "",
+) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(
+        [
+            "Карточка процесса.",
+            "",
+            f"Проект: `{Path(run.project_path).name}`",
+            f"Run ID: `{run.run_id}`",
+            f"Статус: `{run.status.value}`",
+            f"Thread ID: `{run.thread_id or 'none'}`",
+            f"Длительность: `{_format_run_duration(run)}`",
+            f"Последнее обновление: `{_format_last_update(run)}` назад",
+            f"Текущая сессия проекта: `{current_session_thread_id or 'none'}`",
+            f"Текущий проект: `{'да' if is_current_project else 'нет'}`",
+        ]
+    )
+    if run.first_prompt_preview:
+        lines.append(f"Запрос: {run.first_prompt_preview[:160]}")
+    if run.last_progress_summary:
+        lines.append(f"Последний шаг: {run.last_progress_summary[:160]}")
+    if run.first_tool_name:
+        lines.append(f"Первый инструмент: `{run.first_tool_name}`")
+    if run.tool_count:
+        lines.append(f"Инструментов: `{run.tool_count}`")
+    if run.error_message:
+        lines.append(f"Ошибка: `{run.error_message[:160]}`")
+    return "\n".join(lines)

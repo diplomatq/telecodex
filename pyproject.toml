@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 codex-telegram-bot = "codex_telegram_bot.main:run"
+codex-telegram-workspace = "codex_telegram_bot.workspace_cli:run"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

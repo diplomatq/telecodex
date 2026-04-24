@@ -31,6 +31,15 @@ async def amain() -> None:
     await store.initialize()
     logger.info("session_store_initialized", sqlite_path=str(settings.sqlite_path))
 
+    orphaned_run_count = await store.finalize_orphaned_runs()
+    if orphaned_run_count:
+        logger.warning(
+            "orphaned_runs_finalized",
+            orphaned_run_count=orphaned_run_count,
+        )
+    else:
+        logger.info("orphaned_runs_none")
+
     if await store.health_check():
         logger.info("session_store_healthcheck_ok")
     else:

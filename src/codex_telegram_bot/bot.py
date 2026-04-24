@@ -50,7 +50,7 @@ class CodexTelegramBot:
             window_seconds=settings.rate_limit_window_seconds,
         )
         self.observability = ObservabilityService(settings, session_store, logger)
-        self.projects = ProjectService(settings, self.observability.record_event)
+        self.projects = ProjectService(settings, self.observability.record_event, session_store)
         self.responder = TelegramResponder(logger)
         self.inputs = MessageInputPreparer(settings, self._voice, self.observability, logger)
         self.execution_flow = PromptExecutionFlow(
@@ -115,6 +115,7 @@ class CodexTelegramBot:
             Application.builder()
             .token(self.settings.telegram_token_str)
             .rate_limiter(AIORateLimiter())
+            .concurrent_updates(self.settings.max_active_runs_per_user + 1)
             .build()
         )
         app.add_handler(CommandHandler("start", self.start_command))
@@ -122,6 +123,9 @@ class CodexTelegramBot:
         app.add_handler(CommandHandler("controls", self.menu_command))
         app.add_handler(CommandHandler("new", self.new_command))
         app.add_handler(CommandHandler("status", self.status_command))
+        app.add_handler(CommandHandler("sessions", self.sessions_command))
+        app.add_handler(CommandHandler("workspace", self.workspace_command))
+        app.add_handler(CommandHandler("tasks", self.workspace_command))
         app.add_handler(CommandHandler("verbose", self.verbose_command))
         app.add_handler(CommandHandler("repo", self.repo_command))
         app.add_handler(CommandHandler("mode", self.mode_command))
@@ -129,7 +133,7 @@ class CodexTelegramBot:
         app.add_handler(
             CallbackQueryHandler(
                 self.handle_ui_callback,
-                pattern=r"^(?:nav:|action:(?:new|create_project)$|verbose:|repo:|mode:)",
+                pattern=r"^(?:nav:|action:(?:new|create_project)$|verbose:|repo:|mode:|session:|workspace:|run:)",
             )
         )
         app.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
@@ -149,7 +153,9 @@ class CodexTelegramBot:
                 BotCommand("start", "Начать работу с ботом"),
                 BotCommand("menu", "Открыть текущее меню сессии"),
                 BotCommand("repo", "Выбрать или создать проект"),
+                BotCommand("workspace", "Сводка по проектам и фоновым процессам"),
                 BotCommand("mode", "Изменить режим доступа"),
+                BotCommand("sessions", "Выбрать старую сессию Codex"),
                 BotCommand("new", "Начать новую сессию Codex"),
                 BotCommand("status", "Показать технический статус"),
             ]
@@ -171,6 +177,12 @@ class CodexTelegramBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.command_handlers.status_command(update, context)
+
+    async def sessions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.command_handlers.sessions_command(update, context)
+
+    async def workspace_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.command_handlers.workspace_command(update, context)
 
     async def verbose_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.command_handlers.verbose_command(update, context)
@@ -217,12 +229,17 @@ class CodexTelegramBot:
         return TelegramResponder.chunk_text(text, size)
 
     @staticmethod
-    def _build_progress_text(elapsed_seconds: int, last_progress_lines: list[str]) -> str:
-        return build_progress_text(elapsed_seconds, last_progress_lines)
+    def _build_progress_text(
+        elapsed_seconds: int,
+        last_progress_lines: list[str],
+        *,
+        project_name: str = "",
+    ) -> str:
+        return build_progress_text(elapsed_seconds, last_progress_lines, project_name=project_name)
 
     @staticmethod
-    def build_stop_keyboard(user_id: int):
-        return build_stop_keyboard(user_id)
+    def build_stop_keyboard(user_id: int, *, run_id: int | None = None):
+        return build_stop_keyboard(user_id, run_id=run_id)
 
     async def _typing_heartbeat(self, **kwargs) -> None:
         self._sync_runtime_settings()

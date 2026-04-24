@@ -15,6 +15,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "approved_directory": tmp_path,
     }
     values.update(overrides)
+    values.setdefault("_env_file", None)
     return Settings(**values)
 
 

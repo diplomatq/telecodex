@@ -20,6 +20,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "voice_transcription_model": "",
     }
     values.update(overrides)
+    values.setdefault("_env_file", None)
     return Settings(**values)
 
 
@@ -28,11 +29,13 @@ def test_settings_parse_allowed_users_and_defaults(tmp_path: Path) -> None:
         tmp_path,
         allowed_users="1, 2,3",
         voice_provider="openai",
+        _env_file=None,
     )
 
     assert settings.allowed_users == [1, 2, 3]
     assert settings.voice_provider == "openai"
     assert settings.resolved_voice_model == "whisper-1"
+    assert settings.max_active_runs_per_user == 5
 
 
 def test_settings_parse_allowed_users_json_string_directly(tmp_path: Path) -> None:
@@ -117,8 +120,41 @@ def test_settings_validate_timeout_and_runs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="CODEX_TIMEOUT_SECONDS"):
         make_settings(tmp_path, codex_timeout_seconds=0)
 
+    with pytest.raises(ValueError, match="CODEX_CONTEXT_WINDOW"):
+        make_settings(tmp_path, codex_context_window=0)
+
+    with pytest.raises(ValueError, match="STATUS_LINE_LIMITS_REFRESH_SECONDS"):
+        make_settings(tmp_path, status_line_limits_refresh_seconds=-1)
+
     with pytest.raises(ValueError, match="MAX_ACTIVE_RUNS_PER_USER"):
         make_settings(tmp_path, max_active_runs_per_user=0)
+
+
+def test_settings_parse_status_line_env_fields(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=token",
+                "TELEGRAM_BOT_USERNAME=codex_bot",
+                f"APPROVED_DIRECTORY={tmp_path}",
+                "ALLOWED_USERS=1",
+                "VOICE_PROVIDER=openai",
+                "STATUS_LINE_ENABLED=false",
+                "STATUS_LINE_TEMPLATE='Project {project}'",
+                "STATUS_LINE_LIMITS_REFRESH_SECONDS=60",
+                "STATUS_LINE_LIMITS_PROMPT='Return {\"limit_5h\":\"unknown\"}'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=env_file)
+
+    assert settings.status_line_enabled is False
+    assert settings.status_line_template == "Project {project}"
+    assert settings.status_line_limits_refresh_seconds == 60
+    assert settings.status_line_limits_prompt == 'Return {"limit_5h":"unknown"}'
 
 
 def test_settings_validate_approved_directory(tmp_path: Path) -> None:

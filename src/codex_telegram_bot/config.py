@@ -21,6 +21,8 @@ class Settings(BaseSettings):
 
     codex_cli_path: str = "codex"
     codex_model: Optional[str] = "gpt-5.3-codex"
+    codex_reasoning_effort: Optional[str] = None
+    codex_context_window: int = 258400
     codex_full_auto: bool = True
     codex_auto_edit: bool = False
     codex_default_launch_mode: CodexLaunchMode = CodexLaunchMode.SANDBOX
@@ -38,9 +40,18 @@ class Settings(BaseSettings):
     voice_max_file_size_mb: int = 20
 
     verbose_level: int = 1
+    status_line_enabled: bool = True
+    status_line_template: str = (
+        "Проект: {project} · Модель: {model} · Режим: {mode} · "
+        "Сессия: {session_short} · Контекст: {context_remaining}/{context_limit} · "
+        "5ч: {limit_5h} · Неделя: {limit_week}"
+    )
+    status_line_limits_refresh_seconds: int = 300
+    status_line_limits_timeout_seconds: int = 8
+    status_line_limits_prompt: str = "/status"
     rate_limit_requests: int = 10
     rate_limit_window_seconds: int = 60
-    max_active_runs_per_user: int = 1
+    max_active_runs_per_user: int = 5
     enable_audit_log: bool = True
     log_level: str = "INFO"
 
@@ -121,6 +132,27 @@ class Settings(BaseSettings):
             raise ValueError("CODEX_TIMEOUT_SECONDS must be > 0")
         return value
 
+    @field_validator("codex_context_window")
+    @classmethod
+    def validate_codex_context_window(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("CODEX_CONTEXT_WINDOW must be > 0")
+        return value
+
+    @field_validator("status_line_limits_refresh_seconds")
+    @classmethod
+    def validate_status_line_limits_refresh_seconds(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("STATUS_LINE_LIMITS_REFRESH_SECONDS must be >= 0")
+        return value
+
+    @field_validator("status_line_limits_timeout_seconds")
+    @classmethod
+    def validate_status_line_limits_timeout_seconds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("STATUS_LINE_LIMITS_TIMEOUT_SECONDS must be > 0")
+        return value
+
     @field_validator("codex_default_launch_mode", mode="before")
     @classmethod
     def validate_codex_default_launch_mode(cls, value) -> CodexLaunchMode:
@@ -188,6 +220,22 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("codex_reasoning_effort", mode="before")
+    @classmethod
+    def normalize_codex_reasoning_effort(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if not normalized:
+            return None
+        valid_efforts = {"low", "medium", "high", "xhigh"}
+        if normalized not in valid_efforts:
+            raise ValueError(
+                "CODEX_REASONING_EFFORT must be one of: "
+                f"{', '.join(sorted(valid_efforts))}"
+            )
+        return normalized
 
     def model_post_init(self, __context) -> None:
         if self.voice_provider == "openai_compatible":

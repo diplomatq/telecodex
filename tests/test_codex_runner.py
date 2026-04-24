@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -19,6 +20,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "codex_cli_path": "codex",
     }
     values.update(overrides)
+    values.setdefault("_env_file", None)
     return Settings(**values)
 
 
@@ -47,6 +49,7 @@ class FakeProcess:
     ):
         self.stdout = FakeStream(lines=stdout_lines or [])
         self.stderr = FakeStream(content=stderr)
+        self.pid = 1234
         self.returncode = None if wait_forever else returncode
         self._final_returncode = -9 if wait_forever else int(returncode or 0)
         self._done = asyncio.Event()
@@ -291,6 +294,142 @@ def test_validate_cli_available_missing_command(monkeypatch: pytest.MonkeyPatch,
         runner.validate_cli_available()
 
 
+def test_discover_latest_session_id_matches_exact_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    sessions_dir = codex_home / "sessions" / "2026" / "04" / "22"
+    sessions_dir.mkdir(parents=True)
+    project_dir = tmp_path / "project"
+    other_dir = tmp_path / "other"
+    project_dir.mkdir()
+    other_dir.mkdir()
+
+    older = sessions_dir / "older.jsonl"
+    newer = sessions_dir / "newer.jsonl"
+    other = sessions_dir / "other.jsonl"
+    older.write_text(
+        '{"type":"session_meta","payload":{"id":"older-session","cwd":"'
+        + str(project_dir)
+        + '"}}\n',
+        encoding="utf-8",
+    )
+    newer.write_text(
+        '{"type":"session_meta","payload":{"id":"newer-session","cwd":"'
+        + str(project_dir)
+        + '"}}\n',
+        encoding="utf-8",
+    )
+    other.write_text(
+        '{"type":"session_meta","payload":{"id":"other-session","cwd":"'
+        + str(other_dir)
+        + '"}}\n',
+        encoding="utf-8",
+    )
+    os.utime(older, (1, 1))
+    os.utime(newer, (3, 3))
+    os.utime(other, (5, 5))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    runner = CodexRunner(make_settings(tmp_path))
+
+    assert runner.discover_latest_session_id(project_dir) == "newer-session"
+    assert runner.discover_latest_session_id(project_dir, modified_after=4) is None
+
+
+def test_discover_local_sessions_lists_matching_cwd_sorted_and_ignores_bad_jsonl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    sessions_dir = codex_home / "sessions" / "2026" / "04" / "22"
+    sessions_dir.mkdir(parents=True)
+    project_dir = tmp_path / "project"
+    other_dir = tmp_path / "other"
+    project_dir.mkdir()
+    other_dir.mkdir()
+
+    def write_session(path: Path, session_id: str, cwd: Path, lines: list[dict | str]) -> None:
+        encoded = [
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "cwd": str(cwd),
+                        "timestamp": "2026-04-22T12:00:00Z",
+                    },
+                }
+            )
+        ]
+        for line in lines:
+            encoded.append(line if isinstance(line, str) else json.dumps(line, ensure_ascii=False))
+        path.write_text("\n".join(encoded) + "\n", encoding="utf-8")
+
+    older = sessions_dir / "older.jsonl"
+    newer = sessions_dir / "newer.jsonl"
+    other = sessions_dir / "other.jsonl"
+    broken = sessions_dir / "broken.jsonl"
+    write_session(
+        older,
+        "older-session",
+        project_dir,
+        [
+            "{broken",
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Implement manual session picker",
+                },
+            },
+        ],
+    )
+    write_session(
+        newer,
+        "newer-session",
+        project_dir,
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "<environment_context>...</environment_context>"},
+                        {"type": "input_text", "text": "Continue old Codex chat"},
+                    ],
+                },
+            }
+        ],
+    )
+    write_session(
+        other,
+        "other-session",
+        other_dir,
+        [
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Wrong project"},
+            }
+        ],
+    )
+    broken.write_text("{not-json\n", encoding="utf-8")
+    os.utime(older, (1, 1))
+    os.utime(newer, (3, 3))
+    os.utime(other, (5, 5))
+    os.utime(broken, (7, 7))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    runner = CodexRunner(make_settings(tmp_path))
+
+    sessions = runner.discover_local_sessions(project_dir)
+
+    assert [session.session_id for session in sessions] == ["newer-session", "older-session"]
+    assert sessions[0].first_prompt == "Continue old Codex chat"
+    assert sessions[1].first_prompt == "Implement manual session picker"
+    assert sessions[0].source_path == newer
+    assert runner.discover_local_sessions(project_dir, limit=1)[0].session_id == "newer-session"
+
+
 @pytest.mark.asyncio
 async def test_runner_rejects_images_when_disabled(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, codex_enable_images=False)
@@ -320,6 +459,7 @@ async def test_runner_builds_read_only_sandbox_command(
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured["args"] = args
+        captured.update(kwargs)
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
@@ -333,6 +473,34 @@ async def test_runner_builds_read_only_sandbox_command(
     assert "--dangerously-bypass-approvals-and-sandbox" not in captured["args"]
     assert "--auto-edit" not in captured["args"]
     assert "--suggest" not in captured["args"]
+    if os.name == "nt":
+        assert "start_new_session" not in captured
+    else:
+        assert captured["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_reasoning_effort_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = make_settings(tmp_path, codex_model="gpt-5.4", codex_reasoning_effort="high")
+    runner = CodexRunner(settings)
+    process = FakeProcess(stdout_lines=['{"type":"item.completed","item":{"type":"assistant_message","text":"ok"}}\n'])
+    captured: dict[str, tuple] = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    response = await runner.run(prompt="hello", cwd=tmp_path, launch_mode=CodexLaunchMode.SANDBOX)
+
+    assert response.status == CodexResultStatus.SUCCESS
+    assert "--model" in captured["args"]
+    assert "gpt-5.4" in captured["args"]
+    assert "--config" in captured["args"]
+    assert 'model_reasoning_effort="high"' in captured["args"]
 
 
 @pytest.mark.asyncio
@@ -356,3 +524,71 @@ async def test_runner_builds_full_access_command(
     assert "--dangerously-bypass-approvals-and-sandbox" in captured["args"]
     assert "--sandbox" not in captured["args"]
     assert 'web_search="disabled"' not in captured["args"]
+
+
+@pytest.mark.asyncio
+async def test_runner_kills_process_group_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.codex_timeout_seconds = 0.01
+    runner = CodexRunner(settings)
+    process = FakeProcess(wait_forever=True)
+    killed: list[tuple[int, int]] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        killed.append((pid, sig))
+        process.kill()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("codex_telegram_bot.processes.os.killpg", fake_killpg)
+
+    response = await runner.run(prompt="slow", cwd=tmp_path, launch_mode=CodexLaunchMode.SANDBOX)
+
+    assert response.status == CodexResultStatus.TIMEOUT
+    if os.name != "nt":
+        assert killed == [(process.pid, 9)]
+
+
+@pytest.mark.asyncio
+async def test_runner_kills_process_group_on_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    settings.codex_timeout_seconds = 10
+    runner = CodexRunner(settings)
+    interrupt_event = asyncio.Event()
+    process = FakeProcess(wait_forever=True)
+    killed: list[tuple[int, int]] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        killed.append((pid, sig))
+        process.kill()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("codex_telegram_bot.processes.os.killpg", fake_killpg)
+
+    async def trigger_interrupt() -> None:
+        await asyncio.sleep(0.01)
+        interrupt_event.set()
+
+    task = asyncio.create_task(trigger_interrupt())
+    response = await runner.run(
+        prompt="stop",
+        cwd=tmp_path,
+        launch_mode=CodexLaunchMode.SANDBOX,
+        interrupt_event=interrupt_event,
+    )
+    await task
+
+    assert response.status == CodexResultStatus.INTERRUPTED
+    if os.name != "nt":
+        assert killed == [(process.pid, 9)]

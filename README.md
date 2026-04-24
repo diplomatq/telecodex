@@ -60,6 +60,20 @@
 
 Параллельно остаётся техническая наблюдаемость: структурированные `JSON`-логи, журнал аудита и состояние сессий в SQLite.
 
+## 📝 Что уже изменено
+
+Ниже зафиксировано текущее состояние после последних доработок.
+
+- главное меню стало компактным `hub`-экраном с действиями `Проект`, `Сессии`, `Сводка`, `Режим`, `Новая сессия`
+- `/start`, `/menu` и связанные экраны сокращены и переведены в более операционный формат
+- добавлен ручной выбор локальных Codex-сессий проекта через `/sessions`
+- добавлена сводка по проектам и запускам через `/workspace` и `/tasks`
+- бот сохраняет последний выбранный проект пользователя и восстанавливает его после рестарта
+- кнопка `⏹ Остановить` обрабатывается параллельно с активным запуском и не должна блокироваться длинным запросом
+- при `Stop` и по timeout завершается вся группа процессов Codex, а не только родительский `codex exec`
+- добавлена `status line` с проектом, моделью, режимом, сессией, остатком контекста и полями `5ч` / `Неделя`
+- live-запрос квот временно отключён по умолчанию, потому что создавал технические Codex-сессии и был источником подвисаний
+
 ## ⚡ Быстрый старт
 
 ### 1. 🧰 Установить Codex CLI
@@ -93,7 +107,9 @@ ALLOWED_USERS=[123456789]
 DATABASE_URL=sqlite:///./codex_telegram_bot.db
 
 CODEX_CLI_PATH=codex
-CODEX_MODEL=gpt-5.3-codex
+CODEX_MODEL=gpt-5.4
+CODEX_REASONING_EFFORT=high
+CODEX_CONTEXT_WINDOW=258400
 CODEX_DEFAULT_LAUNCH_MODE=sandbox
 CODEX_SKIP_GIT_REPO_CHECK=true
 CODEX_TIMEOUT_SECONDS=900
@@ -108,6 +124,11 @@ VOICE_TRANSCRIPTION_MODEL=whisper-large-v3-turbo
 VOICE_MAX_FILE_SIZE_MB=20
 
 VERBOSE_LEVEL=1
+STATUS_LINE_ENABLED=true
+STATUS_LINE_TEMPLATE='Проект: {project} · Модель: {model} · Режим: {mode} · Сессия: {session_short} · Контекст: {context_remaining}/{context_limit} · 5ч: {limit_5h} · Неделя: {limit_week}'
+STATUS_LINE_LIMITS_REFRESH_SECONDS=300
+STATUS_LINE_LIMITS_TIMEOUT_SECONDS=8
+STATUS_LINE_LIMITS_PROMPT=
 RATE_LIMIT_REQUESTS=10
 RATE_LIMIT_WINDOW_SECONDS=60
 ENABLE_AUDIT_LOG=true
@@ -149,15 +170,19 @@ LOG_LEVEL=INFO
 - `/repo new <name>` — создать новый проект; имя будет преобразовано в `slug`
 - `/mode` — открыть выбор режима доступа для текущего проекта
 - `/new` — сбросить текущую Codex-сессию проекта
+- `/sessions` — открыть локальные Codex-сессии текущего проекта
+- `/workspace` и `/tasks` — открыть сводку по проектам и запускам
 - `/status` — показать технический статус: проект, путь, `thread_id`, режим, уровень подробности и последний статус
 - `/verbose` — открыть выбор уровня подробности
 - `/verbose 0|1|2` — задать уровень подробности напрямую
 
 ### 🗂️ Кнопки и меню
 
-Текущее меню даёт три основных действия:
+Текущее меню даёт основные действия:
 
 - `📁 Проект` — открыть список проектов
+- `🗂 Сессии` — открыть локальные Codex-сессии текущего проекта
+- `📊 Сводка` — открыть сводку по проектам и активным/завершённым запускам
 - `⚙️ Режим` — открыть выбор режима доступа
 - `🆕 Новая сессия` — начать новую Codex-сессию в текущем проекте
 
@@ -197,6 +222,8 @@ LOG_LEVEL=INFO
 
 - для каждого `(user, project)` хранится отдельный `thread_id`
 - состояние сессии сохраняется в SQLite вместе с `last_status` и `last_error`
+- бот запоминает последний выбранный проект пользователя и восстанавливает его после рестарта
+- можно вручную выбрать локальную Codex-сессию проекта для продолжения
 - если `resume` возвращает восстановимую ошибку продолжения сессии, бот автоматически делает новый запуск и сохраняет причину повторного старта
 
 ### 🔐 Режимы запуска Codex
@@ -232,6 +259,8 @@ LOG_LEVEL=INFO
 | --- | --- | --- |
 | `CODEX_CLI_PATH` | путь или имя бинарника Codex CLI | по умолчанию `codex` |
 | `CODEX_MODEL` | модель для Codex CLI | по умолчанию `gpt-5.3-codex`; если очистить значение, флаг `--model` не передаётся |
+| `CODEX_REASONING_EFFORT` | reasoning effort для Codex CLI | `low`, `medium`, `high` или `xhigh`; если очистить значение, override не передаётся |
+| `CODEX_CONTEXT_WINDOW` | размер контекстного окна для расчёта остатка в Telegram | используется только для отображения остатка в ответах |
 | `CODEX_DEFAULT_LAUNCH_MODE` | режим по умолчанию для новых проектов | `sandbox` или `full_access` |
 | `CODEX_SKIP_GIT_REPO_CHECK` | добавляет `--skip-git-repo-check` | по умолчанию `true` |
 | `CODEX_TIMEOUT_SECONDS` | таймаут одного запуска Codex | должен быть больше `0` |
@@ -255,10 +284,22 @@ LOG_LEVEL=INFO
 | Переменная | Что делает | Комментарий |
 | --- | --- | --- |
 | `VERBOSE_LEVEL` | уровень подробности по умолчанию | допустимы `0`, `1`, `2` |
+| `STATUS_LINE_ENABLED` | включает status line в ответах | по умолчанию `true` |
+| `STATUS_LINE_TEMPLATE` | шаблон нижней строки статуса | поддерживает макросы проекта, модели, режима, сессии, контекста и квот |
+| `STATUS_LINE_LIMITS_REFRESH_SECONDS` | время кеша статуса лимитов | `0` отключает кеш |
+| `STATUS_LINE_LIMITS_TIMEOUT_SECONDS` | таймаут live-запроса лимитов | по умолчанию `8` |
+| `STATUS_LINE_LIMITS_PROMPT` | prompt для отдельного запроса квот через Codex CLI | пустое значение отключает live-квоты и использует только локальный fallback |
 | `RATE_LIMIT_REQUESTS` | число запросов на пользователя | используется вместе с окном ниже |
 | `RATE_LIMIT_WINDOW_SECONDS` | окно ограничения частоты | ограничитель хранится в памяти процесса |
 | `ENABLE_AUDIT_LOG` | включает журнал аудита в SQLite | по умолчанию `true` |
 | `LOG_LEVEL` | уровень логирования | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+
+### 📏 Status Line и квоты
+
+- status line показывает проект, модель, режим, короткий `thread_id`, остаток контекста и поля `5ч`/`Неделя`
+- если `STATUS_LINE_LIMITS_PROMPT` пустой, бот не запускает отдельный `codex exec` для получения квот
+- в этом режиме квоты берутся только из локального fallback по последним Codex-сессиям; если данных нет, выводится `unknown`
+- live-запрос квот сейчас временно отключён по умолчанию, потому что создавал технические Codex-сессии и был источником подвисаний
 
 ### 🎧 Рабочие сценарии для голосовых сообщений
 
@@ -289,6 +330,7 @@ VOICE_TRANSCRIPTION_MODEL=whisper-large-v3-turbo
 - на один bot token должен быть запущен только один `polling`-процесс
 - если поднять второй экземпляр одновременно, Telegram вернёт `409 Conflict`
 - если перезапустить процесс во время активного запроса, этот запрос не переживёт `restart`
+- после рестарта бот восстанавливает последний выбранный проект пользователя
 
 ### 🪟 Запуск через `tmux`
 
@@ -366,6 +408,14 @@ sudo systemctl restart codex-telegram-bot
 sudo journalctl -u codex-telegram-bot -f
 ```
 
+На текущем сервере сервис развёрнут как `telecodex.service`, поэтому для живой инсталляции используются команды:
+
+```bash
+sudo systemctl status telecodex.service
+sudo systemctl restart telecodex.service
+sudo journalctl -u telecodex.service -f
+```
+
 ## 🧪 Логи, SQLite и тесты
 
 ### 🗃️ Логи и SQLite
@@ -374,6 +424,7 @@ sudo journalctl -u codex-telegram-bot -f
 - SQLite работает в режиме `WAL`
 - `project_sessions` хранит `thread_id`, `last_status`, `last_error` и время обновления
 - `project_preferences` хранит `launch_mode` отдельно для каждого пользователя и проекта
+- `user_preferences` хранит `current_project_path` и позволяет вернуть пользователя в последний проект после рестарта
 - `audit_log` хранит журнал аудита, в который события только добавляются, если `ENABLE_AUDIT_LOG=true`
 
 ### 🏗️ Коротко об архитектуре
@@ -382,7 +433,9 @@ sudo journalctl -u codex-telegram-bot -f
 - `bot.py` собирает Telegram application и регистрирует обработчики
 - `handlers` и `flows` разделяют навигацию и выполнение запросов
 - `SessionStore` отвечает за SQLite-сессии, журнал аудита и настройки проекта
-- `CodexRunner` адаптирует Codex CLI и нормализует поток событий
+- `CodexRunner` адаптирует Codex CLI, нормализует поток событий и очищает всё дерево дочерних процессов по timeout/interrupt
+- `services/status_line.py` отвечает за рендер status line, кеширование лимитов и локальный fallback
+- `processes.py` отвечает за запуск subprocess в отдельной process group и их безопасное завершение
 - `ProjectService`, `ObservabilityService` и `VoiceTranscriber` отвечают за маршрутизацию по рабочей области, журналирование и расшифровку
 - `telegram/ui` и `telegram_formatting.py` отвечают за клавиатуры, тексты, `HTML`-рендеринг и разбиение длинных ответов
 
@@ -399,7 +452,8 @@ env PYTHONPATH=src .venv/bin/python -m compileall -q src tests
 
 - валидацию конфигурации
 - миграции SQLite и хранение сессий
-- работу `CodexRunner`, `timeout`, `interrupt` и повторный запуск после ошибок `resume`
+- работу `CodexRunner`, `timeout`, `interrupt`, очистку process tree и повторный запуск после ошибок `resume`
+- status line, локальный fallback лимитов и парсинг `token_count/rate_limits`
 - навигацию и сценарии выполнения
 - подготовку входных данных для `text`, `document`, `voice` и `photo`
 - журналирование, диагностику и форматирование ответов для Telegram
@@ -413,3 +467,4 @@ env PYTHONPATH=src .venv/bin/python -m compileall -q src tests
 - список проектов ограничен директориями первого уровня внутри `APPROVED_DIRECTORY`
 - поддержка фотографий зависит от текущей поддержки `--image` в Codex CLI
 - расшифровка голосовых сообщений ограничена внешними сервисами `openai` и `openai_compatible`
+- live-квоты в status line сейчас временно отключены через пустой `STATUS_LINE_LIMITS_PROMPT`

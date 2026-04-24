@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +19,27 @@ class CodexResultStatus(StringEnum):
     TIMEOUT = "timeout"
     CLI_ERROR = "cli_error"
     PROTOCOL_ERROR = "protocol_error"
+
+
+class ProjectRunStatus(StringEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = CodexResultStatus.SUCCESS.value
+    INTERRUPTED = CodexResultStatus.INTERRUPTED.value
+    RESUME_FAILED = CodexResultStatus.RESUME_FAILED.value
+    TIMEOUT = CodexResultStatus.TIMEOUT.value
+    CLI_ERROR = CodexResultStatus.CLI_ERROR.value
+    PROTOCOL_ERROR = CodexResultStatus.PROTOCOL_ERROR.value
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ProjectRunStatus":
+        if isinstance(value, cls):
+            return value
+        normalized = str(value or cls.QUEUED.value).strip().lower()
+        for candidate in cls:
+            if candidate.value == normalized:
+                return candidate
+        return cls.QUEUED
 
 
 class CodexLaunchMode(StringEnum):
@@ -55,6 +77,7 @@ class CodexStreamEvent:
     kind: CodexStreamEventKind = CodexStreamEventKind.UNKNOWN
     text_delta: str = ""
     text_snapshot: str = ""
+    thread_id: str = ""
     tool_call: Optional[CodexToolCall] = None
     lifecycle_name: str = ""
     usage: dict[str, int] = field(default_factory=dict)
@@ -84,6 +107,53 @@ class ProjectSession:
     updated_at: str
     last_status: str = ""
     last_error: str = ""
+
+
+@dataclass
+class LocalCodexSession:
+    session_id: str
+    cwd: Path
+    created_at: datetime
+    updated_at: datetime
+    source_path: Path
+    first_prompt: str = ""
+
+
+@dataclass
+class ProjectRun:
+    run_id: int
+    user_id: int
+    project_path: str
+    thread_id: str
+    status: ProjectRunStatus
+    started_at: datetime
+    finished_at: Optional[datetime]
+    last_update_at: datetime
+    first_prompt_preview: str = ""
+    last_progress_summary: str = ""
+    first_tool_name: str = ""
+    tool_count: int = 0
+    error_message: str = ""
+    stop_requested: bool = False
+
+    @property
+    def project_name(self) -> str:
+        return Path(self.project_path).name
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == ProjectRunStatus.RUNNING
+
+
+@dataclass
+class ProjectActivitySummary:
+    project_path: str
+    project_name: str
+    is_current: bool
+    current_session_thread_id: str = ""
+    active_run: Optional[ProjectRun] = None
+    latest_run: Optional[ProjectRun] = None
+    recent_run_count: int = 0
 
 
 @dataclass

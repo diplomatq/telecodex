@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,12 +17,15 @@ from ..models import (
     CodexLaunchMode,
     CodexResponse,
     CodexResultStatus,
+    ProjectRun,
+    ProjectRunStatus,
     CodexStreamEvent,
     PreparedCodexRequest,
 )
 from ..rate_limiter import RateLimiter
 from ..services.observability import ObservabilityService
 from ..services.projects import ProjectService
+from ..services.status_line import CodexLimitStatusProvider, StatusLineRenderer
 from ..session_store import SessionStore
 from ..telegram.ui.keyboards import (
     build_full_access_warning_keyboard,
@@ -37,10 +41,24 @@ from ..telegram.ui.texts import (
     render_launch_mode_editor_text,
     render_launch_mode_label,
     render_no_projects_text,
+    wrap_project_message,
 )
 
 
+@dataclass
+class ActiveRunHandle:
+    run_id: int
+    user_id: int
+    project_path: str
+    interrupt_event: asyncio.Event
+
+
 class PromptExecutionFlow:
+    ACTIVE_RUN_MESSAGE = (
+        "Достигнут лимит активных запусков. Открой `/workspace`, "
+        "чтобы переключиться на один из процессов или остановить его."
+    )
+
     def __init__(
         self,
         settings: Settings,
@@ -51,6 +69,7 @@ class PromptExecutionFlow:
         observability: ObservabilityService,
         responder: TelegramResponder,
         logger: Any,
+        limit_status_provider: Optional[CodexLimitStatusProvider] = None,
     ):
         self.settings = settings
         self.session_store = session_store
@@ -60,9 +79,15 @@ class PromptExecutionFlow:
         self.observability = observability
         self.responder = responder
         self.logger = logger
+        self.limit_status_provider = limit_status_provider or CodexLimitStatusProvider(
+            settings,
+            logger,
+        )
         self.typing_heartbeat_seconds = 4.0
         self.progress_heartbeat_seconds = 2.0
         self.active_interrupts: dict[int, asyncio.Event] = {}
+        self.active_runs: dict[int, ActiveRunHandle] = {}
+        self.active_runs_by_user: dict[int, dict[int, ActiveRunHandle]] = {}
 
     @staticmethod
     def _mode_changed_notice(launch_mode: CodexLaunchMode) -> str:
@@ -83,6 +108,55 @@ class PromptExecutionFlow:
         if stored is not None:
             return stored
         return CodexLaunchMode.from_value(self.settings.codex_default_launch_mode)
+
+    def active_run_count(self, user_id: int) -> int:
+        return len(self.active_runs_by_user.get(user_id, {}))
+
+    def has_active_run(self, user_id: int) -> bool:
+        return self.active_run_count(user_id) > 0
+
+    def render_active_run_limit_message(self, user_id: int) -> str:
+        active_count = self.active_run_count(user_id)
+        limit = self.settings.max_active_runs_per_user
+        return (
+            f"Достигнут лимит активных запусков: `{active_count}/{limit}`.\n\n"
+            "Открой `/workspace`, чтобы переключиться на один из процессов или остановить его."
+        )
+
+    def has_active_run_for_project(self, user_id: int, project_path: str) -> bool:
+        runs = self.active_runs_by_user.get(user_id, {})
+        return any(handle.project_path == project_path for handle in runs.values())
+
+    def get_active_run(self, run_id: int) -> Optional[ActiveRunHandle]:
+        return self.active_runs.get(run_id)
+
+    def _register_active_run(self, handle: ActiveRunHandle) -> None:
+        self.active_runs[handle.run_id] = handle
+        runs = self.active_runs_by_user.setdefault(handle.user_id, {})
+        runs[handle.run_id] = handle
+        self.active_interrupts[handle.user_id] = handle.interrupt_event
+
+    def _unregister_active_run(self, run_id: int) -> None:
+        handle = self.active_runs.pop(run_id, None)
+        if handle is None:
+            return
+        runs = self.active_runs_by_user.get(handle.user_id)
+        if runs is not None:
+            runs.pop(run_id, None)
+            if runs:
+                next_handle = next(reversed(runs.values()))
+                self.active_interrupts[handle.user_id] = next_handle.interrupt_event
+            else:
+                self.active_runs_by_user.pop(handle.user_id, None)
+                self.active_interrupts.pop(handle.user_id, None)
+
+    async def stop_run(self, *, user_id: int, run_id: int) -> bool:
+        handle = self.active_runs.get(run_id)
+        if handle is None or handle.user_id != user_id:
+            return False
+        handle.interrupt_event.set()
+        await self.session_store.update_project_run(run_id, stop_requested=True)
+        return True
 
     async def show_mode_editor(
         self,
@@ -105,7 +179,7 @@ class PromptExecutionFlow:
             text = render_launch_mode_editor_text(
                 project_name=project.path.name,
                 launch_mode=launch_mode,
-                has_active_run=update.effective_user.id in self.active_interrupts,
+                has_active_run=self.has_active_run(update.effective_user.id),
                 notice=notice,
             )
             reply_markup = build_mode_editor_keyboard(
@@ -193,6 +267,19 @@ class PromptExecutionFlow:
         request_context,
     ) -> None:
         user_id = update.effective_user.id
+        if self.active_run_count(user_id) >= self.settings.max_active_runs_per_user:
+            limit_message = self.render_active_run_limit_message(user_id)
+            await self.observability.record_event(
+                "codex_request_rejected",
+                request_context,
+                audit_event="request_rejected",
+                event_status="active_run",
+                active_run_count=self.active_run_count(user_id),
+                active_run_limit=self.settings.max_active_runs_per_user,
+            )
+            await update.effective_message.reply_text(limit_message, parse_mode="Markdown")
+            await self._cleanup_paths(prepared_request.cleanup_paths)
+            return
         if not self.rate_limiter.allow(user_id):
             await self.observability.record_event(
                 "codex_request_rate_limited",
@@ -230,7 +317,11 @@ class PromptExecutionFlow:
                 parse_mode="Markdown",
             )
 
-        previous_thread_id = await self.session_store.get_thread_id(user_id, str(cwd))
+        previous_thread_id = await self.resolve_previous_thread_id(
+            user_id=user_id,
+            cwd=cwd,
+            request_context=request_context,
+        )
         request_context.has_previous_thread = bool(previous_thread_id)
 
         await self.observability.record_event(
@@ -241,16 +332,37 @@ class PromptExecutionFlow:
             thread_id=previous_thread_id or "",
         )
 
-        stop_markup = build_stop_keyboard(user_id)
-        request_started_at = time.monotonic()
-        await update.effective_chat.send_action(ChatAction.TYPING)
-        progress = await update.effective_message.reply_text(
-            build_progress_text(0, []),
-            reply_markup=stop_markup,
+        run_id = await self.session_store.create_project_run(
+            user_id=user_id,
+            project_path=str(cwd),
+            thread_id=previous_thread_id or "",
+            first_prompt_preview=self._build_prompt_preview(prepared_request.prompt),
+        )
+        await self.observability.record_event(
+            "codex_run_created",
+            request_context,
+            audit_event="codex_run_created",
+            event_status="running",
+            run_id=run_id,
+            thread_id=previous_thread_id or "",
         )
 
         interrupt_event = asyncio.Event()
-        self.active_interrupts[user_id] = interrupt_event
+        self._register_active_run(
+            ActiveRunHandle(
+                run_id=run_id,
+                user_id=user_id,
+                project_path=str(cwd),
+                interrupt_event=interrupt_event,
+            )
+        )
+        stop_markup = build_stop_keyboard(user_id, run_id=run_id)
+        request_started_at = time.monotonic()
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        progress = await update.effective_message.reply_text(
+            build_progress_text(0, [], project_name=cwd.name),
+            reply_markup=stop_markup,
+        )
         request_finished = asyncio.Event()
 
         last_progress_lines: list[str] = []
@@ -269,6 +381,7 @@ class PromptExecutionFlow:
             self.progress_heartbeat(
                 progress=progress,
                 stop_markup=stop_markup,
+                run_id=run_id,
                 request_finished=request_finished,
                 request_started_at=request_started_at,
                 last_progress_lines=last_progress_lines,
@@ -318,16 +431,31 @@ class PromptExecutionFlow:
 
             verbose_level = int(context.user_data.get("verbose_level", self.settings.verbose_level))
             if verbose_level == 0:
+                await self.session_store.update_project_run(
+                    run_id,
+                    thread_id=event.thread_id or None,
+                    last_progress_summary=line,
+                    first_tool_name=first_tool or None,
+                    tool_count=tool_count,
+                )
                 return
 
             last_progress_lines.append(line)
             last_progress_lines = last_progress_lines[-12:]
+            await self.session_store.update_project_run(
+                run_id,
+                thread_id=event.thread_id or None,
+                last_progress_summary=line,
+                first_tool_name=first_tool or None,
+                tool_count=tool_count,
+            )
             try:
                 await progress.edit_text(
-                    build_progress_text(
-                        int(time.monotonic() - request_started_at),
-                        last_progress_lines,
-                    ),
+                        build_progress_text(
+                            int(time.monotonic() - request_started_at),
+                            last_progress_lines,
+                            project_name=cwd.name,
+                        ),
                     reply_markup=stop_markup if not interrupt_event.is_set() else None,
                 )
             except Exception:
@@ -347,10 +475,16 @@ class PromptExecutionFlow:
                 image_paths=prepared_request.image_paths or None,
             )
         except Exception as exc:
-            self.active_interrupts.pop(user_id, None)
+            self._unregister_active_run(run_id)
             self.logger.exception(
                 "codex_request_failed_exception",
                 **self.observability.context_fields(request_context),
+            )
+            await self.session_store.update_project_run(
+                run_id,
+                status=ProjectRunStatus.CLI_ERROR,
+                error_message=str(exc),
+                finished=True,
             )
             if previous_thread_id:
                 await self.session_store.update_session_result(
@@ -392,7 +526,7 @@ class PromptExecutionFlow:
                 await typing_task
             with contextlib.suppress(asyncio.CancelledError):
                 await progress_task
-            self.active_interrupts.pop(user_id, None)
+            self._unregister_active_run(run_id)
 
         if response.fallback_reason:
             await self.observability.record_event(
@@ -409,6 +543,25 @@ class PromptExecutionFlow:
             project_path=str(cwd),
             previous_thread_id=previous_thread_id,
             response=response,
+        )
+        await self.session_store.update_project_run(
+            run_id,
+            thread_id=response.thread_id or previous_thread_id or "",
+            status=ProjectRunStatus.from_value(response.status.value),
+            last_progress_summary=last_progress_lines[-1] if last_progress_lines else "",
+            first_tool_name=first_tool or "",
+            tool_count=tool_count,
+            error_message=response.error_message,
+            finished=True,
+        )
+        await self.observability.record_event(
+            "codex_run_finished",
+            request_context,
+            audit_event="codex_run_finished",
+            event_status=str(response.status),
+            run_id=run_id,
+            thread_id=response.thread_id or previous_thread_id or "",
+            tool_count=tool_count,
         )
 
         try:
@@ -445,17 +598,32 @@ class PromptExecutionFlow:
                 **self.observability.response_fields(response),
             )
 
-        final_text = render_final_text(response)
-        token_line = (
-            f"\n\n`[input={response.input_tokens}, cached={response.cached_input_tokens}, "
-            f"output={response.output_tokens}]`"
-            if int(context.user_data.get("verbose_level", self.settings.verbose_level)) >= 1
-            else ""
+        status_line_limits = None
+        if (
+            self.settings.status_line_enabled
+            and StatusLineRenderer.needs_limit_status(self.settings.status_line_template)
+        ):
+            status_line_limits = await self.limit_status_provider.get_status(
+                cwd=cwd,
+                thread_id=response.thread_id or previous_thread_id or "",
+            )
+
+        final_text = wrap_project_message(
+            render_final_text(response),
+            cwd=cwd,
+            settings=self.settings,
+            response=response,
+            thread_id=response.thread_id or previous_thread_id or "",
+            launch_mode=launch_mode,
+            status_line_limits=status_line_limits,
+            include_token_summary=(
+                int(context.user_data.get("verbose_level", self.settings.verbose_level)) >= 1
+            ),
         )
 
         await self.responder.send_final_response(
             update=update,
-            markdown_text=final_text + token_line,
+            markdown_text=final_text,
         )
         await self._cleanup_paths(prepared_request.cleanup_paths)
 
@@ -484,14 +652,60 @@ class PromptExecutionFlow:
                 last_error=response.error_message,
             )
 
+    async def resolve_previous_thread_id(
+        self,
+        *,
+        user_id: int,
+        cwd: Path,
+        request_context,
+    ) -> Optional[str]:
+        stored_thread_id = await self.session_store.get_thread_id(user_id, str(cwd))
+        if stored_thread_id:
+            return stored_thread_id
+
+        reset_at_unix = await self.session_store.get_session_reset_at_unix(user_id, str(cwd))
+        discovered_thread_id = await asyncio.to_thread(
+            self.codex.discover_latest_session_id,
+            cwd,
+            modified_after=reset_at_unix,
+        )
+        if not discovered_thread_id:
+            return None
+
+        await self.session_store.upsert_session(
+            user_id,
+            str(cwd),
+            discovered_thread_id,
+            last_status="discovered",
+        )
+        await self.observability.record_event(
+            "codex_session_discovered",
+            request_context,
+            audit_event="session_discovered",
+            event_status="discovered",
+            thread_id=discovered_thread_id,
+        )
+        return discovered_thread_id
+
     async def stop_callback(self, update: Update, request_context) -> None:
         query = update.callback_query
-        target_user = int(query.data.rsplit(":", 1)[1])
-        interrupt = self.active_interrupts.get(target_user)
+        parts = query.data.split(":")
+        run_id: Optional[int] = None
+        target_user = int(parts[-1])
+        if len(parts) >= 4 and parts[-2].isdigit():
+            run_id = int(parts[-2])
+            target_user = int(parts[-1])
+        interrupt = None
+        if run_id is not None:
+            handle = self.active_runs.get(run_id)
+            interrupt = handle.interrupt_event if handle and handle.user_id == target_user else None
+        else:
+            interrupt = self.active_interrupts.get(target_user)
         await self.observability.record_event(
             "codex_user_interrupt_requested",
             request_context,
             target_user=target_user,
+            run_id=run_id,
             has_active_interrupt=interrupt is not None,
         )
         if query.from_user.id != target_user:
@@ -501,12 +715,15 @@ class PromptExecutionFlow:
             await query.answer("Already finished.")
             return
         interrupt.set()
+        if run_id is not None:
+            await self.session_store.update_project_run(run_id, stop_requested=True)
         await self.observability.record_event(
             "request_interrupted",
             request_context,
             audit_event="request_interrupted",
             event_status="requested",
             target_user=target_user,
+            run_id=run_id,
         )
         await query.answer("Stopping...")
 
@@ -536,6 +753,7 @@ class PromptExecutionFlow:
         *,
         progress: Any,
         stop_markup,
+        run_id: int | None = None,
         request_finished: asyncio.Event,
         request_started_at: float,
         last_progress_lines: list[str],
@@ -547,10 +765,18 @@ class PromptExecutionFlow:
                 await asyncio.sleep(self.progress_heartbeat_seconds)
                 if request_finished.is_set():
                     return
+                if run_id is not None:
+                    run = await self.session_store.get_project_run(
+                        run_id,
+                        user_id=request_context.user_id,
+                    )
+                    if run is not None and run.stop_requested and not interrupt_event.is_set():
+                        interrupt_event.set()
                 await progress.edit_text(
                     build_progress_text(
                         int(time.monotonic() - request_started_at),
                         last_progress_lines,
+                        project_name=Path(request_context.cwd).name if request_context.cwd else "",
                     ),
                     reply_markup=stop_markup if not interrupt_event.is_set() else None,
                 )
@@ -575,3 +801,8 @@ class PromptExecutionFlow:
                 path.unlink(missing_ok=True)
             except Exception:
                 self.logger.warning("photo_tempfile_cleanup_failed", path=str(path))
+
+    @staticmethod
+    def _build_prompt_preview(prompt: str) -> str:
+        text = " ".join(prompt.strip().split())
+        return text[:160]

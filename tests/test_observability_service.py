@@ -18,6 +18,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "allowed_users": "42",
     }
     values.update(overrides)
+    values.setdefault("_env_file", None)
     return Settings(**values)
 
 

@@ -72,6 +72,43 @@ class CallbackHandlers:
             await self.navigation.show_repo_picker(update, context, request_context, edit=True)
             return
 
+        if data == "workspace:list":
+            await query.answer("Сводка")
+            await self.navigation.show_workspace(update, context, request_context, edit=True)
+            return
+
+        if data in {"session:list", "session:refresh"}:
+            await query.answer("Сессии")
+            await self.navigation.show_sessions(update, context, request_context, edit=True)
+            return
+
+        if data.startswith("run:list:"):
+            slug = data.split(":", 2)[2]
+            await query.answer("Запуски")
+            await self.navigation.show_project_runs(update, context, request_context, slug, edit=True)
+            return
+
+        if data.startswith("run:view:"):
+            run_id = int(data.split(":", 2)[2])
+            await query.answer("Процесс")
+            await self.navigation.show_run_detail(update, context, request_context, run_id, edit=True)
+            return
+
+        if data.startswith("run:attach:"):
+            run_id = int(data.split(":", 2)[2])
+            await self.navigation.attach_run_to_project(update, context, request_context, run_id)
+            return
+
+        if data.startswith("session:select:"):
+            session_id = data.split(":", 2)[2]
+            await self.navigation.select_session_from_callback(
+                update,
+                context,
+                request_context,
+                session_id,
+            )
+            return
+
         if data == "action:new":
             project = await self.navigation.projects.resolve_current_project(
                 context,
@@ -141,6 +178,16 @@ class CallbackHandlers:
         if data.startswith("repo:select:"):
             slug = data.split(":", 2)[2]
             await self.navigation.select_repo_from_callback(update, context, request_context, slug)
+            return
+
+        if data.startswith("repo:quick:"):
+            slug = data.split(":", 2)[2]
+            await self.navigation.quick_select_repo_from_menu(
+                update,
+                context,
+                request_context,
+                slug,
+            )
             return
 
         await query.answer("Unknown action.", show_alert=True)
