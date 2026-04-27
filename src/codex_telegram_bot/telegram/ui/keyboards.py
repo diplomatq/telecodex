@@ -3,7 +3,8 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ...models import CodexLaunchMode, LocalCodexSession, ProjectActivitySummary, ProjectRun
-from ...services.projects import RecentProjectOption, RepoOption
+from ...services.projects import ProjectVisibilityOption, RecentProjectOption, RepoOption
+from .texts import render_run_status_label
 
 
 def _shorten_label(value: str, *, limit: int) -> str:
@@ -21,7 +22,11 @@ def render_local_session_button_label(session: LocalCodexSession) -> str:
     return f"{prefix} · {prompt}"
 
 
-def build_session_keyboard(recent_projects: list[RecentProjectOption] | None = None) -> InlineKeyboardMarkup:
+def build_session_keyboard(
+    recent_projects: list[RecentProjectOption] | None = None,
+    *,
+    has_resume_session: bool = False,
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("📁 Проект", callback_data="nav:repo"),
@@ -31,10 +36,13 @@ def build_session_keyboard(recent_projects: list[RecentProjectOption] | None = N
             InlineKeyboardButton("📊 Сводка", callback_data="workspace:list"),
             InlineKeyboardButton("⚙️ Режим", callback_data="mode:show"),
         ],
-        [
-            InlineKeyboardButton("🆕 Новая сессия", callback_data="action:new"),
-        ],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings:show")],
     ]
+    action_row = []
+    if has_resume_session:
+        action_row.append(InlineKeyboardButton("▶️ Продолжить", callback_data="session:resume_current"))
+    action_row.append(InlineKeyboardButton("🆕 Новая сессия", callback_data="action:new"))
+    rows.append(action_row)
     if recent_projects and len(recent_projects) >= 2:
         first_row = []
         second_row = []
@@ -163,13 +171,24 @@ def build_full_access_warning_keyboard(back_callback: str) -> InlineKeyboardMark
     )
 
 
-def build_workspace_keyboard(summaries: list[ProjectActivitySummary]) -> InlineKeyboardMarkup:
+def build_workspace_keyboard(
+    summaries: list[ProjectActivitySummary],
+    *,
+    page: int = 0,
+    page_size: int = 10,
+) -> InlineKeyboardMarkup:
+    total = len(summaries)
+    safe_page_size = max(page_size, 1)
+    max_page = max((total - 1) // safe_page_size, 0)
+    current_page = min(max(page, 0), max_page)
+    start = current_page * safe_page_size
+    end = start + safe_page_size
     rows = []
-    for summary in summaries[:10]:
+    for summary in summaries[start:end]:
         label = summary.project_name
         target_run = summary.active_run or summary.latest_run
         if target_run is not None:
-            label = f"{label} · {target_run.status.value}"
+            label = f"{label} · {render_run_status_label(target_run.status)}"
             if target_run.thread_id:
                 rows.append(
                     [
@@ -183,20 +202,84 @@ def build_workspace_keyboard(summaries: list[ProjectActivitySummary]) -> InlineK
                 )
             continue
         rows.append(
-            [InlineKeyboardButton(label, callback_data=f"run:list:{summary.project_name}")]
+            [InlineKeyboardButton(label, callback_data=f"repo:select:{summary.project_path}")]
         )
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="workspace:list")])
+    navigation_row = []
+    if current_page > 0:
+        navigation_row.append(
+            InlineKeyboardButton("⬅️ Назад", callback_data=f"workspace:list:{current_page - 1}")
+        )
+    if current_page < max_page:
+        navigation_row.append(
+            InlineKeyboardButton("➡️ Дальше", callback_data=f"workspace:list:{current_page + 1}")
+        )
+    if navigation_row:
+        rows.append(navigation_row)
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"workspace:list:{current_page}")])
     rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_project_runs_keyboard(project_slug: str, runs: list[ProjectRun]) -> InlineKeyboardMarkup:
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👁 Видимость проектов", callback_data="settings:projects")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu")],
+        ]
+    )
+
+
+def build_project_visibility_keyboard(
+    entries: list[ProjectVisibilityOption],
+    *,
+    page: int = 0,
+    page_size: int = 20,
+) -> InlineKeyboardMarkup:
+    total = len(entries)
+    safe_page_size = max(page_size, 1)
+    max_page = max((total - 1) // safe_page_size, 0)
+    current_page = min(max(page, 0), max_page)
+    start = current_page * safe_page_size
+    end = start + safe_page_size
+    page_entries = entries[start:end]
+    rows = []
+    for entry in page_entries:
+        if entry.is_hidden:
+            label = f"👁 Показать {entry.label}"
+            callback = f"project:show:{entry.key}"
+        else:
+            label = f"🙈 Скрыть {entry.label}"
+            callback = f"project:hide:{entry.key}"
+        if entry.is_current:
+            label = f"◉ {label}"
+        rows.append([InlineKeyboardButton(label, callback_data=callback)])
+    navigation_row = []
+    if current_page > 0:
+        navigation_row.append(
+            InlineKeyboardButton("⬅️ Назад", callback_data=f"settings:projects:{current_page - 1}")
+        )
+    if current_page < max_page:
+        navigation_row.append(
+            InlineKeyboardButton("➡️ Дальше", callback_data=f"settings:projects:{current_page + 1}")
+        )
+    if navigation_row:
+        rows.append(navigation_row)
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"settings:projects:{current_page}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="settings:show")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_project_runs_keyboard(project_key: str, runs: list[ProjectRun]) -> InlineKeyboardMarkup:
     rows = []
     for run in runs[:10]:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"#{run.run_id} · {run.status.value}",
+                    f"#{run.run_id} · {render_run_status_label(run.status)}",
                     callback_data=f"run:view:{run.run_id}",
                 )
             ]
@@ -204,7 +287,7 @@ def build_project_runs_keyboard(project_slug: str, runs: list[ProjectRun]) -> In
     rows.extend(
         [
             [
-                InlineKeyboardButton("🔄 Обновить", callback_data=f"run:list:{project_slug}"),
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"run:list:{project_key}"),
                 InlineKeyboardButton("📊 Сводка", callback_data="workspace:list"),
             ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu")],
@@ -224,7 +307,7 @@ def build_run_detail_keyboard(
         rows.append([InlineKeyboardButton("🔗 Сделать текущей", callback_data=f"run:attach:{run.run_id}")])
     if run.is_active:
         rows.append([InlineKeyboardButton("⏹ Остановить", callback_data=f"action:stop:{run.run_id}:{user_id}")])
-    rows.append([InlineKeyboardButton("📁 Открыть проект", callback_data=f"repo:select:{run.project_name}")])
-    rows.append([InlineKeyboardButton("🗂 Запуски проекта", callback_data=f"run:list:{run.project_name}")])
+    rows.append([InlineKeyboardButton("📁 Открыть проект", callback_data=f"repo:select:{run.project_path}")])
+    rows.append([InlineKeyboardButton("🗂 Запуски проекта", callback_data=f"run:list:{run.project_path}")])
     rows.append([InlineKeyboardButton("📊 Сводка", callback_data="workspace:list")])
     return InlineKeyboardMarkup(rows)

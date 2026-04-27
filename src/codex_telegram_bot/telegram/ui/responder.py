@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from typing import Any, Optional
 
 from telegram import InlineKeyboardMarkup, Update
@@ -27,6 +29,47 @@ class TelegramResponder:
             chunks.append(text[start:end])
             start = end
         return chunks
+
+    @staticmethod
+    def render_ui_text(text: str) -> str:
+        parts = re.split(r"(`[^`]+`)", text)
+        rendered_parts: list[str] = []
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("`") and part.endswith("`") and len(part) >= 2:
+                rendered_parts.append(f"<code>{html.escape(part[1:-1])}</code>")
+                continue
+            plain = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", part)
+            rendered_parts.append(html.escape(plain))
+        return "".join(rendered_parts)
+
+    async def edit_ui_message(
+        self,
+        update: Update,
+        text: str,
+        *,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        await self.edit_callback_message(
+            update,
+            self.render_ui_text(text),
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def send_ui_message(
+        self,
+        *,
+        update: Update,
+        text: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        return await update.effective_message.reply_text(
+            self.render_ui_text(text),
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
 
     async def edit_callback_message(
         self,

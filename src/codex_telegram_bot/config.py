@@ -7,6 +7,7 @@ from typing import Annotated, Optional
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .capabilities import RuntimeCapabilities, resolve_runtime_capabilities
 from .models import CodexLaunchMode
 
 
@@ -311,3 +312,7 @@ class Settings(BaseSettings):
                     "VOICE_TRANSCRIPTION_MODEL must be configured when "
                     "VOICE_PROVIDER=openai_compatible"
                 )
+
+    @property
+    def runtime_capabilities(self) -> RuntimeCapabilities:
+        return resolve_runtime_capabilities(self)

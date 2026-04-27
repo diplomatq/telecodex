@@ -12,16 +12,11 @@ from ...models import (
     LocalCodexSession,
     ProjectActivitySummary,
     ProjectRun,
+    ProjectRunStatus,
 )
+from ...project_labels import render_project_display_name
 from ...services.status_line import CodexLimitStatus, StatusLineRenderer
-from ...services.projects import RepoOption
-
-
-def render_project_display_name(path: Optional[Path]) -> str:
-    if path is None:
-        return "не выбран"
-    resolved = path.resolve()
-    return str(resolved.parent / resolved.name)
+from ...services.projects import ProjectVisibilityOption, RepoOption
 
 
 def render_launch_mode_label(launch_mode: CodexLaunchMode) -> str:
@@ -174,6 +169,7 @@ def render_session_text(
     launch_mode: CodexLaunchMode,
     has_session: bool,
     has_active_run: bool,
+    has_resume_session: bool = False,
     recent_project_count: int = 0,
     active_run_count: int = 0,
     active_run_limit: int = 0,
@@ -200,6 +196,8 @@ def render_session_text(
         lines.append("Запуск: `выполняется`")
     else:
         lines.append("Выбери действие ниже или отправь задачу сообщением.")
+    if has_resume_session:
+        lines.append("Быстрый старт: продолжить последнюю сессию в один тап.")
     if recent_project_count >= 2:
         lines.append("Недавние: переключение в один тап.")
     if active_run_count:
@@ -292,12 +290,12 @@ def render_repo_picker_text(
 ) -> str:
     text = "Проекты.\n\nВыбери активный проект."
     if auto_created:
-        current_created = next((entry.slug for entry in entries if entry.is_current), "")
+        current_created = next((entry.label for entry in entries if entry.is_current), "")
         if current_created:
             text = f"Создан первый проект `{current_created}`.\n\n" + text
     if truncated:
         text += "\n\nПоказаны первые 20 проектов."
-    current = next((entry.slug for entry in entries if entry.is_current), "")
+    current = next((entry.label for entry in entries if entry.is_current), "")
     if current:
         text += f"\n\nТекущий: `{current}`"
     return text
@@ -319,6 +317,65 @@ def render_no_projects_text() -> str:
     )
 
 
+def render_settings_text(*, current_project: Optional[Path] = None, notice: str = "") -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(
+        [
+            "Настройки.",
+            "",
+            f"Проект: `{render_project_display_name(current_project)}`",
+            "Управляй доступом к проектам и режимами бота.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_project_visibility_text(
+    entries: list[ProjectVisibilityOption],
+    *,
+    page: int = 0,
+    page_size: int = 20,
+    notice: str = "",
+) -> str:
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    total = len(entries)
+    safe_page_size = max(page_size, 1)
+    max_page = max((total - 1) // safe_page_size, 0)
+    current_page = min(max(page, 0), max_page)
+    start = current_page * safe_page_size
+    end = min(start + safe_page_size, total)
+    lines.extend(
+        [
+            "Видимость проектов.",
+            "",
+            "`◉` текущий проект",
+            "`🙈` скрыт",
+            "",
+        ]
+    )
+    if not entries:
+        lines.append("Доступных проектов нет.")
+        return "\n".join(lines)
+    lines.append(f"Страница `{current_page + 1}/{max_page + 1}` · показаны `{start + 1}-{end}` из `{total}`")
+    lines.append("")
+    for entry in entries[start:end]:
+        prefix = []
+        if entry.is_current:
+            prefix.append("◉")
+        if entry.is_hidden:
+            prefix.append("🙈")
+        marker = "".join(prefix)
+        if marker:
+            lines.append(f"{marker} `{entry.label}`")
+        else:
+            lines.append(f"• `{entry.label}`")
+    return "\n".join(lines)
+
+
 def render_final_text(response: CodexResponse) -> str:
     if response.status == CodexResultStatus.SUCCESS:
         return response.final_text or "Готово, но Codex не вернул финальный текст."
@@ -336,6 +393,15 @@ def render_final_text(response: CodexResponse) -> str:
     if response.status == CodexResultStatus.CLI_ERROR:
         return response.final_text or f"Codex CLI завершился с ошибкой: {response.error_message}"
     return response.final_text or f"Request failed: {response.error_message}"
+
+
+def render_run_status_label(status: ProjectRunStatus | str) -> str:
+    normalized = ProjectRunStatus.from_value(status)
+    if normalized == ProjectRunStatus.STOPPED_BY_USER:
+        return "stopped_by_user"
+    if normalized == ProjectRunStatus.ORPHANED_AFTER_RESTART:
+        return "orphaned_after_restart"
+    return normalized.value
 
 
 def build_progress_text(
@@ -392,6 +458,8 @@ def render_workspace_text(
     notice: str = "",
     active_run_count: int = 0,
     active_run_limit: int = 0,
+    page: int = 0,
+    page_size: int = 10,
 ) -> str:
     lines = []
     if notice:
@@ -406,24 +474,56 @@ def render_workspace_text(
     if not summaries:
         lines.append("Проекты не найдены.")
         return "\n".join(lines)
-    visible_summaries = [summary for summary in summaries if (summary.active_run or summary.latest_run) is not None]
-    if not visible_summaries:
-        lines.append("Нет активных или завершённых процессов.")
+    total = len(summaries)
+    if not summaries:
+        lines.append("Проекты не найдены.")
         return "\n".join(lines)
-    for summary in visible_summaries:
+    safe_page_size = max(page_size, 1)
+    max_page = max((total - 1) // safe_page_size, 0)
+    current_page = min(max(page, 0), max_page)
+    start = current_page * safe_page_size
+    end = min(start + safe_page_size, total)
+    page_items = summaries[start:end]
+    live_count = sum(1 for summary in summaries if summary.active_run is not None)
+    error_count = sum(
+        1
+        for summary in summaries
+        if summary.latest_run is not None
+        and summary.latest_run.status in {
+            ProjectRunStatus.CLI_ERROR,
+            ProjectRunStatus.PROTOCOL_ERROR,
+            ProjectRunStatus.TIMEOUT,
+            ProjectRunStatus.RESUME_FAILED,
+            ProjectRunStatus.ORPHANED_AFTER_RESTART,
+        }
+    )
+    lines.append(f"Проектов в выдаче: `{total}`")
+    lines.append(f"Live: `{live_count}` · Проблемных: `{error_count}`")
+    lines.append(f"Страница `{current_page + 1}/{max_page + 1}` · показаны `{start + 1}-{end}`")
+    lines.append("")
+    for summary in page_items:
         run = summary.active_run or summary.latest_run
+        if run is None:
+            marker = "•◉" if summary.is_current else "•"
+            lines.append(f"{marker} `{summary.project_name}` · `idle`")
+            if summary.current_session_thread_id:
+                lines.append(f"сессия `{summary.current_session_thread_id[:8]}`")
+            lines.append("")
+            continue
         marker = "•"
         if summary.active_run is not None:
             marker = "⏵"
         if summary.is_current:
             marker = f"{marker}◉"
-        status = run.status.value
+        status = render_run_status_label(run.status)
         lines.append(f"{marker} `{summary.project_name}` · `{status}`")
         lines.append(
             f"длительность `{_format_run_duration(run)}` · обновление `{_format_last_update(run)}` назад"
         )
         if run.last_progress_summary:
             lines.append(run.last_progress_summary[:120])
+        elif run.first_prompt_preview:
+            lines.append(run.first_prompt_preview[:120])
         if summary.current_session_thread_id:
             lines.append(f"сессия `{summary.current_session_thread_id[:8]}`")
         if summary.recent_run_count:
@@ -452,7 +552,7 @@ def render_project_runs_text(
         return "\n".join(lines)
     for run in runs:
         lines.append(
-            f"#{run.run_id} · `{run.status.value}` · `{_format_run_duration(run)}` · thread `{(run.thread_id or 'none')[:8]}`"
+            f"#{run.run_id} · `{render_run_status_label(run.status)}` · `{_format_run_duration(run)}` · thread `{(run.thread_id or 'none')[:8]}`"
         )
         if run.last_progress_summary:
             lines.append(run.last_progress_summary[:120])
@@ -478,7 +578,7 @@ def render_run_detail_text(
             "",
             f"Проект: `{render_project_display_name(Path(run.project_path))}`",
             f"Run ID: `{run.run_id}`",
-            f"Статус: `{run.status.value}`",
+            f"Статус: `{render_run_status_label(run.status)}`",
             f"Thread ID: `{run.thread_id or 'none'}`",
             f"Длительность: `{_format_run_duration(run)}`",
             f"Последнее обновление: `{_format_last_update(run)}` назад",

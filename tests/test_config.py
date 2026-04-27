@@ -197,6 +197,25 @@ def test_settings_validate_openai_compatible_voice_provider(tmp_path: Path) -> N
     assert settings.voice_provider == "openai_compatible"
     assert settings.voice_api_base_url == "https://api.groq.com/openai/v1"
     assert settings.resolved_voice_model == "whisper-large-v3-turbo"
+    assert settings.runtime_capabilities.voice is True
+    assert settings.runtime_capabilities.voice_provider == "openai_compatible"
+    assert settings.runtime_capabilities.voice_model == "whisper-large-v3-turbo"
+
+
+def test_settings_runtime_capabilities_for_disabled_voice_and_live_limits(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        enable_voice_messages=False,
+        enable_file_uploads=False,
+        codex_enable_images=True,
+        status_line_limits_prompt="/status",
+    )
+
+    assert settings.runtime_capabilities.text is True
+    assert settings.runtime_capabilities.files is False
+    assert settings.runtime_capabilities.voice is False
+    assert settings.runtime_capabilities.images is True
+    assert settings.runtime_capabilities.live_status_limits is True
 
 
 def test_settings_require_openai_compatible_voice_fields(tmp_path: Path) -> None:

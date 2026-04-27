@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 
 from ..config import Settings
 from ..models import RequestContext
+from ..project_labels import render_project_display_name
 from ..session_store import SessionStore
 
 RecordEvent = Callable[..., Awaitable[None]]
@@ -28,6 +29,14 @@ class RecentProjectOption:
     key: str
     slug: str
     label: str
+    is_current: bool = False
+
+
+@dataclass(frozen=True)
+class ProjectVisibilityOption:
+    key: str
+    label: str
+    is_hidden: bool = False
     is_current: bool = False
 
 
@@ -61,7 +70,7 @@ class ProjectService:
             try:
                 current_path = Path(current).resolve()
                 self.ensure_in_workspace(current_path)
-                if self._is_selectable_project_path(current_path):
+                if self._is_allowed_project_path(current_path):
                     return ProjectResolution(path=current_path)
             except Exception:
                 pass
@@ -71,7 +80,8 @@ class ProjectService:
             context.user_data["current_directory"] = remembered
             return ProjectResolution(path=remembered)
 
-        projects = self.list_project_paths()
+        user_id = request_context.user_id if request_context is not None else None
+        projects = self.list_project_paths(user_id=user_id)
         if projects:
             context.user_data["current_directory"] = projects[0]
             await self._remember_current_project(request_context, projects[0])
@@ -93,10 +103,15 @@ class ProjectService:
                 continue
         raise PermissionError(f"Path outside approved directory: {path}")
 
-    def list_repo_options(self, context: ContextTypes.DEFAULT_TYPE) -> tuple[list[RepoOption], bool]:
+    def list_repo_options(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        user_id: Optional[int] = None,
+    ) -> tuple[list[RepoOption], bool]:
         current = context.user_data.get("current_directory")
         current_path = Path(current).resolve() if current is not None else None
-        entries = self.list_project_paths()
+        entries = self.list_project_paths(user_id=user_id)
         truncated = len(entries) > 20
         options = [
             RepoOption(
@@ -109,28 +124,42 @@ class ProjectService:
         ]
         return options, truncated
 
-    def resolve_repo_slug(self, slug: str) -> Path:
-        candidates = [path for path in self.list_project_paths() if path.name == slug]
+    def resolve_repo_slug(self, slug: str, *, user_id: Optional[int] = None) -> Path:
+        candidates = [path for path in self.list_project_paths(user_id=user_id) if path.name == slug]
         if len(candidates) == 1:
             return candidates[0]
         if not candidates:
             raise FileNotFoundError(slug)
         raise PermissionError(slug)
 
-    def resolve_repo_key(self, key: str) -> Path:
+    def resolve_repo_key(
+        self,
+        key: str,
+        *,
+        user_id: Optional[int] = None,
+        include_hidden: bool = False,
+    ) -> Path:
         candidate = Path(key).expanduser().resolve()
         self.ensure_in_workspace(candidate)
         if not candidate.exists():
             raise FileNotFoundError(key)
         if not candidate.is_dir():
             raise NotADirectoryError(key)
-        if not self._is_selectable_project_path(candidate):
+        if not self._is_allowed_project_path(candidate):
+            raise PermissionError(key)
+        if not include_hidden and user_id is not None and self._is_hidden_for_user(user_id, candidate):
             raise PermissionError(key)
         return candidate
 
-    def list_project_paths(self) -> list[Path]:
+    def list_project_paths(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        include_hidden: bool = False,
+    ) -> list[Path]:
         visible_names = {name.strip() for name in self.settings.project_visible_names if name.strip()}
         ignored_names = {name.strip() for name in self.settings.project_ignore_names if name.strip()}
+        hidden_paths = self._hidden_project_paths(user_id) if user_id is not None and not include_hidden else set()
         entries: list[Path] = []
         primary_root = self.settings.approved_directory.resolve()
         for root in self.project_roots:
@@ -145,12 +174,23 @@ class ProjectService:
                     continue
                 if visible_names and path.name not in visible_names:
                     continue
-                entries.append(path.resolve())
+                resolved = path.resolve()
+                if str(resolved) in hidden_paths:
+                    continue
+                entries.append(resolved)
         entries.sort(key=lambda item: (self.render_project_label(item), str(item)))
         return entries
 
-    def list_project_path_strings(self) -> list[str]:
-        return [str(path.resolve()) for path in self.list_project_paths()]
+    def list_project_path_strings(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        include_hidden: bool = False,
+    ) -> list[str]:
+        return [
+            str(path.resolve())
+            for path in self.list_project_paths(user_id=user_id, include_hidden=include_hidden)
+        ]
 
     async def list_recent_repo_options(
         self,
@@ -162,7 +202,7 @@ class ProjectService:
         if self.session_store is None or limit <= 0:
             return []
 
-        available_paths = self.list_project_paths()
+        available_paths = self.list_project_paths(user_id=user_id)
         available_path_map = {str(path.resolve()): path for path in available_paths}
         recent_paths = await self.session_store.list_recent_projects(
             user_id,
@@ -180,6 +220,39 @@ class ProjectService:
             for path in recent_paths
             if path in available_path_map
         ]
+
+    async def list_project_visibility_options(
+        self,
+        *,
+        user_id: int,
+        current_project_path: Optional[Path] = None,
+    ) -> list[ProjectVisibilityOption]:
+        hidden_paths = set(await self.session_store.list_hidden_projects(user_id)) if self.session_store else set()
+        entries = self.list_project_paths(user_id=user_id, include_hidden=True)
+        current_key = str(current_project_path.resolve()) if current_project_path is not None else ""
+        return [
+            ProjectVisibilityOption(
+                key=self.path_to_key(entry),
+                label=self.render_project_label(entry),
+                is_hidden=str(entry.resolve()) in hidden_paths,
+                is_current=str(entry.resolve()) == current_key,
+            )
+            for entry in entries
+        ]
+
+    async def set_project_hidden_state(
+        self,
+        *,
+        user_id: int,
+        project_path: Path,
+        hidden: bool,
+    ) -> None:
+        if self.session_store is None:
+            return
+        resolved = project_path.resolve()
+        if not self._is_allowed_project_path(resolved):
+            raise PermissionError(str(project_path))
+        await self.session_store.set_project_hidden_state(user_id, str(resolved), hidden=hidden)
 
     def workspace_is_empty(self, root: Path) -> bool:
         for entry in root.iterdir():
@@ -211,7 +284,7 @@ class ProjectService:
         return resolved
 
     def render_project_label(self, path: Path) -> str:
-        return str(path.resolve())
+        return render_project_display_name(path)
 
     def path_to_key(self, path: Path) -> str:
         return str(path.resolve())
@@ -229,7 +302,7 @@ class ProjectService:
             return None
         return max(matching_roots, key=lambda item: len(item.parts))
 
-    def _is_selectable_project_path(self, path: Path) -> bool:
+    def _is_allowed_project_path(self, path: Path) -> bool:
         resolved = path.resolve()
         root = self._find_project_root(resolved)
         if root is None:
@@ -245,6 +318,17 @@ class ProjectService:
         if visible_names and resolved.name not in visible_names:
             return False
         return True
+
+    def _hidden_project_paths(self, user_id: int) -> set[str]:
+        if self.session_store is None:
+            return set()
+        try:
+            return set(self.session_store.list_hidden_projects_sync(user_id))
+        except Exception:
+            return set()
+
+    def _is_hidden_for_user(self, user_id: int, path: Path) -> bool:
+        return str(path.resolve()) in self._hidden_project_paths(user_id)
 
     @staticmethod
     def sanitize_project_name(name: str) -> str:
@@ -336,7 +420,7 @@ class ProjectService:
         try:
             remembered_path = Path(remembered).resolve()
             self.ensure_in_workspace(remembered_path)
-            if self._is_selectable_project_path(remembered_path):
+            if self._is_allowed_project_path(remembered_path):
                 return remembered_path
         except Exception:
             return None

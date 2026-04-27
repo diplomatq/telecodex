@@ -14,6 +14,7 @@ from .models import (
     ProjectRunStatus,
     ProjectSession,
 )
+from .project_labels import render_project_display_name
 
 
 class _AsyncCursor:
@@ -131,6 +132,12 @@ class SessionStore:
         if current_version < 7:
             await self._migration_v7()
             await self._set_schema_version(7)
+        if current_version < 8:
+            await self._migration_v8()
+            await self._set_schema_version(8)
+        if current_version < 9:
+            await self._migration_v9()
+            await self._set_schema_version(9)
 
     async def _get_schema_version(self) -> int:
         conn = self._require_conn()
@@ -326,6 +333,39 @@ class SessionStore:
             WHERE TRIM(current_project_path) != ''
             ON CONFLICT(user_id, project_path)
             DO UPDATE SET updated_at=excluded.updated_at
+            """
+        )
+
+    async def _migration_v8(self) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            UPDATE project_runs
+            SET status = ?
+            WHERE status = ?
+            """,
+            (
+                ProjectRunStatus.STOPPED_BY_USER.value,
+                "interrupted",
+            ),
+        )
+
+    async def _migration_v9(self) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_hidden_projects (
+                user_id INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, project_path)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_hidden_projects_user_updated
+            ON user_hidden_projects(user_id, updated_at DESC)
             """
         )
 
@@ -556,7 +596,7 @@ class SessionStore:
             WHERE status = ?
             """,
             (
-                ProjectRunStatus.INTERRUPTED.value,
+                ProjectRunStatus.ORPHANED_AFTER_RESTART.value,
                 error_message,
                 ProjectRunStatus.RUNNING.value,
             ),
@@ -615,6 +655,78 @@ class SessionStore:
             recent_paths.insert(0, current_project_path)
 
         return recent_paths[:limit]
+
+    async def list_hidden_projects(self, user_id: int) -> list[str]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT project_path
+            FROM user_hidden_projects
+            WHERE user_id = ?
+            ORDER BY updated_at DESC, project_path ASC
+            """,
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        return [str(row["project_path"] or "").strip() for row in rows if str(row["project_path"] or "").strip()]
+
+    def list_hidden_projects_sync(self, user_id: int) -> list[str]:
+        if self.conn is None:
+            raise RuntimeError("SessionStore is not initialized")
+        conn = _AsyncConnection._open(self.db_path)
+        try:
+            cursor = conn.execute(
+                """
+                SELECT project_path
+                FROM user_hidden_projects
+                WHERE user_id = ?
+                ORDER BY updated_at DESC, project_path ASC
+                """,
+                (user_id,),
+            )
+            try:
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+            return [
+                str(row["project_path"] or "").strip()
+                for row in rows
+                if str(row["project_path"] or "").strip()
+            ]
+        finally:
+            conn.close()
+
+    async def is_project_hidden(self, user_id: int, project_path: str) -> bool:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT 1
+            FROM user_hidden_projects
+            WHERE user_id = ? AND project_path = ?
+            """,
+            (user_id, project_path),
+        )
+        row = await cursor.fetchone()
+        return row is not None
+
+    async def set_project_hidden_state(self, user_id: int, project_path: str, *, hidden: bool) -> None:
+        conn = self._require_conn()
+        if hidden:
+            await conn.execute(
+                """
+                INSERT INTO user_hidden_projects (user_id, project_path, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, project_path)
+                DO UPDATE SET updated_at=CURRENT_TIMESTAMP
+                """,
+                (user_id, project_path),
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM user_hidden_projects WHERE user_id = ? AND project_path = ?",
+                (user_id, project_path),
+            )
+        await conn.commit()
 
     async def log_audit_event(
         self,
@@ -801,12 +913,13 @@ class SessionStore:
             summaries.append(
                 ProjectActivitySummary(
                     project_path=project_path,
-                    project_name=Path(project_path).name,
+                    project_name=render_project_display_name(Path(project_path)),
                     is_current=project_path == current_project_path,
                     current_session_thread_id=session.thread_id if session else "",
                     active_run=active_run,
                     latest_run=latest_run,
                     recent_run_count=len(project_runs),
+                    is_live=active_run is not None,
                 )
             )
         summaries.sort(

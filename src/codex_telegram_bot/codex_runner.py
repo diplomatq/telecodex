@@ -621,11 +621,18 @@ class CodexRunner:
         )
 
     def _ensure_in_workspace(self, candidate: Path) -> None:
-        root = self.settings.approved_directory.resolve()
-        try:
-            candidate.resolve().relative_to(root)
-        except ValueError as exc:
-            raise PermissionError(f"Path outside approved directory: {candidate}") from exc
+        resolved = candidate.resolve()
+        roots = [
+            self.settings.approved_directory.resolve(),
+            *self.settings.additional_project_directories,
+        ]
+        for root in roots:
+            try:
+                resolved.relative_to(Path(root).expanduser().resolve())
+                return
+            except ValueError:
+                continue
+        raise PermissionError(f"Path outside approved directory: {candidate}")
 
 
 class _RunState:

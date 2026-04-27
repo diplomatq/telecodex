@@ -8,6 +8,7 @@ import structlog
 from .bot import CodexTelegramBot
 from .config import Settings
 from .logging_utils import configure_logging
+from .preflight import run_preflight
 from .session_store import SessionStore
 
 
@@ -31,27 +32,25 @@ async def amain() -> None:
     await store.initialize()
     logger.info("session_store_initialized", sqlite_path=str(settings.sqlite_path))
 
-    orphaned_run_count = await store.finalize_orphaned_runs()
-    if orphaned_run_count:
-        logger.warning(
-            "orphaned_runs_finalized",
-            orphaned_run_count=orphaned_run_count,
-        )
+    bot = CodexTelegramBot(settings, store)
+    report = await run_preflight(
+        settings=settings,
+        store=store,
+        codex_cli_validator=bot.codex.validate_cli_available,
+        finalize_orphaned_runs=True,
+    )
+    if report.orphaned_run_count:
+        logger.warning("orphaned_runs_finalized", orphaned_run_count=report.orphaned_run_count)
     else:
         logger.info("orphaned_runs_none")
-
-    if await store.health_check():
+    if report.sqlite_ok:
         logger.info("session_store_healthcheck_ok")
     else:
         logger.error("session_store_healthcheck_failed")
         raise RuntimeError("Session store health check failed")
-
-    bot = CodexTelegramBot(settings, store)
-    try:
-        bot.codex.validate_cli_available()
-    except Exception:
-        logger.exception("codex_cli_preflight_failed")
-        raise
+    if not report.codex_cli_ok:
+        logger.exception("codex_cli_preflight_failed", errors=report.errors)
+        raise RuntimeError("; ".join(report.errors))
     logger.info("codex_cli_preflight_ok", codex_cli_path=settings.codex_cli_path)
 
     logger.info("telegram_app_building")

@@ -46,10 +46,39 @@ class CallbackHandlers:
             await query.answer("Access denied.", show_alert=True)
             return
 
+        self.navigation.cancel_live_run_detail_monitor(update)
+        self.navigation.cancel_live_workspace_monitor(update)
         data = query.data or ""
         if data in {"nav:menu", "nav:controls"}:
             await query.answer("Menu")
             await self.navigation.show_menu(update, context, request_context, edit=True)
+            return
+
+        if data == "settings:show":
+            await query.answer("Настройки")
+            await self.navigation.show_settings(update, context, request_context, edit=True)
+            return
+
+        if data == "settings:projects":
+            await query.answer("Проекты")
+            await self.navigation.show_project_visibility_settings(
+                update,
+                context,
+                request_context,
+                edit=True,
+            )
+            return
+
+        if data.startswith("settings:projects:"):
+            page = int(data.rsplit(":", 1)[1])
+            await query.answer("Проекты")
+            await self.navigation.show_project_visibility_settings(
+                update,
+                context,
+                request_context,
+                edit=True,
+                page=page,
+            )
             return
 
         if data == "nav:start":
@@ -77,9 +106,19 @@ class CallbackHandlers:
             await self.navigation.show_workspace(update, context, request_context, edit=True)
             return
 
+        if data.startswith("workspace:list:"):
+            page = int(data.rsplit(":", 1)[1])
+            await query.answer("Сводка")
+            await self.navigation.show_workspace(update, context, request_context, edit=True, page=page)
+            return
+
         if data in {"session:list", "session:refresh"}:
             await query.answer("Сессии")
             await self.navigation.show_sessions(update, context, request_context, edit=True)
+            return
+
+        if data == "session:resume_current":
+            await self.navigation.resume_current_session(update, context, request_context)
             return
 
         if data.startswith("run:list:"):
@@ -116,11 +155,10 @@ class CallbackHandlers:
             )
             if project.path is None:
                 await query.answer("Create a project first.", show_alert=True)
-                await self.navigation.responder.edit_callback_message(
+                await self.navigation.responder.edit_ui_message(
                     update,
                     render_no_projects_text(),
                     reply_markup=build_no_project_keyboard(),
-                    parse_mode="Markdown",
                 )
                 return
             await self.observability.record_event(
@@ -187,6 +225,28 @@ class CallbackHandlers:
                 context,
                 request_context,
                 slug,
+            )
+            return
+
+        if data.startswith("project:hide:"):
+            project_key = data.split(":", 2)[2]
+            await self.navigation.set_project_visibility_from_callback(
+                update,
+                context,
+                request_context,
+                project_key,
+                hidden=True,
+            )
+            return
+
+        if data.startswith("project:show:"):
+            project_key = data.split(":", 2)[2]
+            await self.navigation.set_project_visibility_from_callback(
+                update,
+                context,
+                request_context,
+                project_key,
+                hidden=False,
             )
             return
 

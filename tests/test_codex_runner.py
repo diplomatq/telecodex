@@ -110,6 +110,34 @@ async def test_runner_success_and_event_normalization(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_runner_allows_cwd_from_additional_project_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    extra_root = tmp_path / "extra-root"
+    extra_root.mkdir()
+    project_dir = extra_root / "landing"
+    project_dir.mkdir()
+    settings = make_settings(tmp_path, additional_project_directories=[extra_root])
+    runner = CodexRunner(settings)
+    process = FakeProcess(
+        stdout_lines=['{"type":"item.completed","item":{"type":"assistant_message","text":"ok"}}\n']
+    )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    response = await runner.run(
+        prompt="hello",
+        cwd=project_dir,
+        launch_mode=CodexLaunchMode.SANDBOX,
+    )
+
+    assert response.status == CodexResultStatus.SUCCESS
+
+
+@pytest.mark.asyncio
 async def test_runner_raises_subprocess_stream_limit_for_large_json_events(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

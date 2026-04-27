@@ -56,7 +56,7 @@ def test_status_line_renderer_substitutes_basic_macros(tmp_path: Path) -> None:
         limits=limits,
     )
 
-    assert f"Project app {cwd} app" in line
+    assert f"Project {tmp_path.name}/app {cwd} app" in line
     assert "Model gpt5 high full_access" in line
     assert "Session thread-abcdef thread-a success 1234 1.234" in line
     assert "Tokens 10/4/5/15" in line
@@ -101,7 +101,7 @@ def test_status_line_renderer_leaves_unknown_macro_visible(tmp_path: Path) -> No
     cwd = tmp_path / "app"
     cwd.mkdir()
 
-    assert renderer.render(cwd=cwd) == "ok app {typo_macro}"
+    assert renderer.render(cwd=cwd) == f"ok {tmp_path.name}/app {{typo_macro}}"
 
 
 def test_status_line_renderer_respects_enabled_flag(tmp_path: Path) -> None:

@@ -5,8 +5,10 @@ from telegram.ext import ContextTypes
 
 from ..flows.execution import PromptExecutionFlow
 from ..flows.navigation import NavigationFlow
+from ..preflight import render_preflight_report, run_preflight
 from ..services.observability import ObservabilityService
 from ..telegram.ui.keyboards import build_verbose_keyboard
+from ..telegram.ui.responder import TelegramResponder
 from ..telegram.ui.texts import render_verbose_text
 
 
@@ -20,6 +22,7 @@ class CommandHandlers:
         self.navigation = navigation
         self.execution = execution
         self.observability = observability
+        self.responder = TelegramResponder(observability.logger)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         request_context = self.observability.make_request_context(
@@ -140,6 +143,35 @@ class CommandHandlers:
         )
         await self.navigation.show_workspace(update, context, request_context)
 
+    async def health_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        request_context = self.observability.make_request_context(
+            update,
+            context,
+            source="command",
+            command_name="health",
+        )
+        await self.observability.record_event("telegram_update_received", request_context)
+        if not await self.observability.ensure_authorized(update, request_context):
+            return
+        report = await run_preflight(
+            settings=self.navigation.settings,
+            store=self.navigation.session_store,
+            codex_cli_validator=self.execution.codex.validate_cli_available,
+            finalize_orphaned_runs=False,
+        )
+        await self.observability.record_event(
+            "telegram_command_health",
+            request_context,
+            audit_event="command_health",
+            event_status="ok" if report.ok else "failed",
+            orphaned_run_count=report.orphaned_run_count,
+            errors=report.errors,
+        )
+        await self.responder.send_ui_message(
+            update=update,
+            text=render_preflight_report(report, sqlite_path=self.navigation.settings.sqlite_path),
+        )
+
     async def verbose_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         request_context = self.observability.make_request_context(
             update,
@@ -161,17 +193,17 @@ class CommandHandlers:
                 raise ValueError
         except ValueError:
             current = int(context.user_data.get("verbose_level", self.navigation.settings.verbose_level))
-            await update.effective_message.reply_text(
-                "Используй `/verbose 0|1|2` или выбери уровень кнопкой ниже.",
+            await self.responder.send_ui_message(
+                update=update,
+                text="Используй `/verbose 0|1|2` или выбери уровень кнопкой ниже.",
                 reply_markup=build_verbose_keyboard(current),
-                parse_mode="Markdown",
             )
             return
         context.user_data["verbose_level"] = level
-        await update.effective_message.reply_text(
-            render_verbose_text(level),
+        await self.responder.send_ui_message(
+            update=update,
+            text=render_verbose_text(level),
             reply_markup=build_verbose_keyboard(level),
-            parse_mode="Markdown",
         )
 
     async def repo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

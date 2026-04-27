@@ -126,6 +126,7 @@ class CodexTelegramBot:
         app.add_handler(CommandHandler("sessions", self.sessions_command))
         app.add_handler(CommandHandler("workspace", self.workspace_command))
         app.add_handler(CommandHandler("tasks", self.workspace_command))
+        app.add_handler(CommandHandler("health", self.health_command))
         app.add_handler(CommandHandler("verbose", self.verbose_command))
         app.add_handler(CommandHandler("repo", self.repo_command))
         app.add_handler(CommandHandler("mode", self.mode_command))
@@ -133,7 +134,7 @@ class CodexTelegramBot:
         app.add_handler(
             CallbackQueryHandler(
                 self.handle_ui_callback,
-                pattern=r"^(?:nav:|action:(?:new|create_project)$|verbose:|repo:|mode:|session:|workspace:|run:)",
+                pattern=r"^(?:nav:|settings:|project:|action:(?:new|create_project)$|verbose:|repo:|mode:|session:|workspace:|run:)",
             )
         )
         app.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
@@ -158,6 +159,7 @@ class CodexTelegramBot:
                 BotCommand("sessions", "Выбрать старую сессию Codex"),
                 BotCommand("new", "Начать новую сессию Codex"),
                 BotCommand("status", "Показать технический статус"),
+                BotCommand("health", "Проверить конфиг и доступность сервисов"),
             ]
         )
         await target_app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -183,6 +185,9 @@ class CodexTelegramBot:
 
     async def workspace_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.command_handlers.workspace_command(update, context)
+
+    async def health_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.command_handlers.health_command(update, context)
 
     async def verbose_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self.command_handlers.verbose_command(update, context)

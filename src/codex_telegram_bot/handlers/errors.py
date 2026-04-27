@@ -6,12 +6,14 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ..services.observability import ObservabilityService
+from ..telegram.ui.responder import TelegramResponder
 
 
 class ErrorHandlers:
     def __init__(self, observability: ObservabilityService, logger: Any):
         self.observability = observability
         self.logger = logger
+        self.responder = TelegramResponder(logger)
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         request_context = None
@@ -31,6 +33,9 @@ class ErrorHandlers:
         )
         if isinstance(update, Update) and update.effective_message:
             try:
-                await update.effective_message.reply_text(f"Error: {context.error}")
+                await self.responder.send_ui_message(
+                    update=update,
+                    text=f"Error: {context.error}",
+                )
             except Exception:
                 self.logger.exception("telegram_error_reply_failed")

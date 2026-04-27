@@ -25,7 +25,8 @@ class ProjectRunStatus(StringEnum):
     QUEUED = "queued"
     RUNNING = "running"
     SUCCESS = CodexResultStatus.SUCCESS.value
-    INTERRUPTED = CodexResultStatus.INTERRUPTED.value
+    STOPPED_BY_USER = "stopped_by_user"
+    ORPHANED_AFTER_RESTART = "orphaned_after_restart"
     RESUME_FAILED = CodexResultStatus.RESUME_FAILED.value
     TIMEOUT = CodexResultStatus.TIMEOUT.value
     CLI_ERROR = CodexResultStatus.CLI_ERROR.value
@@ -39,6 +40,8 @@ class ProjectRunStatus(StringEnum):
         for candidate in cls:
             if candidate.value == normalized:
                 return candidate
+        if normalized == CodexResultStatus.INTERRUPTED.value:
+            return cls.STOPPED_BY_USER
         return cls.QUEUED
 
 
@@ -154,6 +157,7 @@ class ProjectActivitySummary:
     active_run: Optional[ProjectRun] = None
     latest_run: Optional[ProjectRun] = None
     recent_run_count: int = 0
+    is_live: bool = False
 
 
 @dataclass

@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import Settings
 from .models import ProjectRun
 from .services.projects import ProjectService
-from .telegram.ui.texts import render_project_display_name
+from .telegram.ui.texts import render_project_display_name, render_run_status_label
 
 
 def _format_duration(run: ProjectRun) -> str:
@@ -58,7 +58,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
         user_id = settings.allowed_users[0] if settings.allowed_users else 0
         if args.entity == "workspace":
             if args.project:
-                project_path = str(project_service.resolve_repo_slug(args.project).resolve())
+                project_path = str(project_service.resolve_repo_slug(args.project, user_id=user_id).resolve())
                 rows = conn.execute(
                     """
                     SELECT run_id, project_path, thread_id, status, started_at, finished_at, last_update_at
@@ -69,11 +69,11 @@ def _run_sync(argv: list[str] | None = None) -> int:
                     """,
                     (user_id, project_path),
                 ).fetchall()
-                print(Path(project_path).name)
+                print(render_project_display_name(Path(project_path)))
                 for row in rows:
                     run = _row_to_run(row)
                     print(
-                        f"#{run.run_id} {run.status.value} {_format_duration(run)} {run.thread_id[:8] or 'none'}"
+                        f"#{run.run_id} {render_run_status_label(run.status)} {_format_duration(run)} {run.thread_id[:8] or 'none'}"
                     )
                 return 0
             current_row = conn.execute(
@@ -81,7 +81,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 (user_id,),
             ).fetchone()
             current_project = str(current_row["current_project_path"]) if current_row else ""
-            for path in project_service.list_project_paths():
+            for path in project_service.list_project_paths(user_id=user_id):
                 row = conn.execute(
                     """
                     SELECT run_id, project_path, thread_id, status, started_at, finished_at, last_update_at
@@ -95,7 +95,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 run = _row_to_run(row) if row else None
                 if run is None:
                     continue
-                status = run.status.value
+                status = render_run_status_label(run.status)
                 duration = _format_duration(run)
                 marker = "*" if str(path.resolve()) == current_project else "-"
                 print(f"{marker} {project_service.render_project_label(path)}: {status} {duration}")
@@ -117,7 +117,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
             if args.action == "show":
                 print(f"run_id={run.run_id}")
                 print(f"project={render_project_display_name(Path(run.project_path))}")
-                print(f"status={run.status.value}")
+                print(f"status={render_run_status_label(run.status)}")
                 print(f"thread_id={run.thread_id or 'none'}")
                 print(f"duration={_format_duration(run)}")
                 progress = str(row["last_progress_summary"] or "").strip()
@@ -162,7 +162,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 return 0
         if args.entity == "project" and args.action == "switch":
             try:
-                project_path = project_service.resolve_repo_slug(args.slug)
+                project_path = project_service.resolve_repo_slug(args.slug, user_id=user_id)
             except (FileNotFoundError, NotADirectoryError, PermissionError):
                 print("Project not found")
                 return 1
@@ -176,7 +176,7 @@ def _run_sync(argv: list[str] | None = None) -> int:
                 (user_id, str(project_path)),
             )
             conn.commit()
-            print(f"Current project: {project_path.name}")
+            print(f"Current project: {render_project_display_name(project_path)}")
             return 0
         return 1
     finally:

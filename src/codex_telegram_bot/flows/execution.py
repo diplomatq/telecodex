@@ -97,6 +97,12 @@ class PromptExecutionFlow:
             "Следующие запросы в этом проекте будут использовать его."
         )
 
+    @staticmethod
+    def _project_run_status_from_response(response: CodexResponse) -> ProjectRunStatus:
+        if response.status == CodexResultStatus.INTERRUPTED:
+            return ProjectRunStatus.STOPPED_BY_USER
+        return ProjectRunStatus.from_value(response.status.value)
+
     async def resolve_launch_mode(
         self,
         *,
@@ -189,18 +195,9 @@ class PromptExecutionFlow:
                 back_callback="nav:menu",
             )
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def set_launch_mode(
         self,
@@ -211,11 +208,10 @@ class PromptExecutionFlow:
         request_context = self.observability.make_request_context(update, context, source="command")
         project = await self.projects.resolve_current_project(context, request_context=request_context)
         if project.path is None:
-            await self.responder.edit_callback_message(
+            await self.responder.edit_ui_message(
                 update,
                 render_no_projects_text(),
                 reply_markup=build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             return
         await self.session_store.set_project_launch_mode(
@@ -238,18 +234,16 @@ class PromptExecutionFlow:
         request_context = self.observability.make_request_context(update, context, source="command")
         project = await self.projects.resolve_current_project(context, request_context=request_context)
         if project.path is None:
-            await self.responder.edit_callback_message(
+            await self.responder.edit_ui_message(
                 update,
                 render_no_projects_text(),
                 reply_markup=build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             return
-        await self.responder.edit_callback_message(
+        await self.responder.edit_ui_message(
             update,
             render_full_access_warning_text(project_name=render_project_display_name(project.path)),
             reply_markup=build_full_access_warning_keyboard("mode:show"),
-            parse_mode="Markdown",
         )
 
     async def enable_full_access(
@@ -278,7 +272,7 @@ class PromptExecutionFlow:
                 active_run_count=self.active_run_count(user_id),
                 active_run_limit=self.settings.max_active_runs_per_user,
             )
-            await update.effective_message.reply_text(limit_message, parse_mode="Markdown")
+            await self.responder.send_ui_message(update=update, text=limit_message)
             await self._cleanup_paths(prepared_request.cleanup_paths)
             return
         if not self.rate_limiter.allow(user_id):
@@ -288,7 +282,10 @@ class PromptExecutionFlow:
                 audit_event="request_failed",
                 event_status="rate_limited",
             )
-            await update.effective_message.reply_text("Rate limit exceeded. Please wait a bit.")
+            await self.responder.send_ui_message(
+                update=update,
+                text="Rate limit exceeded. Please wait a bit.",
+            )
             await self._cleanup_paths(prepared_request.cleanup_paths)
             return
 
@@ -300,10 +297,10 @@ class PromptExecutionFlow:
                 audit_event="project_create_failed",
                 event_status="no_project_selected",
             )
-            await update.effective_message.reply_text(
-                render_no_projects_text(),
+            await self.responder.send_ui_message(
+                update=update,
+                text=render_no_projects_text(),
                 reply_markup=build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             await self._cleanup_paths(prepared_request.cleanup_paths)
             return
@@ -313,9 +310,9 @@ class PromptExecutionFlow:
         request_context.cwd = str(cwd)
         request_context.launch_mode = launch_mode.value
         if project.auto_created:
-            await update.effective_message.reply_text(
-                f"Создал и выбрал первый проект: `{render_project_display_name(cwd)}`.",
-                parse_mode="Markdown",
+            await self.responder.send_ui_message(
+                update=update,
+                text=f"Создал и выбрал первый проект: `{render_project_display_name(cwd)}`.",
             )
 
         previous_thread_id = await self.resolve_previous_thread_id(
@@ -516,7 +513,10 @@ class PromptExecutionFlow:
                     "telegram_progress_delete_failed",
                     **self.observability.context_fields(request_context),
                 )
-            await update.effective_message.reply_text(f"Request failed: {exc}")
+            await self.responder.send_ui_message(
+                update=update,
+                text=f"Request failed: {exc}",
+            )
             await self._cleanup_paths(prepared_request.cleanup_paths)
             return
         finally:
@@ -548,7 +548,7 @@ class PromptExecutionFlow:
         await self.session_store.update_project_run(
             run_id,
             thread_id=response.thread_id or previous_thread_id or "",
-            status=ProjectRunStatus.from_value(response.status.value),
+            status=self._project_run_status_from_response(response),
             last_progress_summary=last_progress_lines[-1] if last_progress_lines else "",
             first_tool_name=first_tool or "",
             tool_count=tool_count,

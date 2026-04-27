@@ -239,6 +239,7 @@ class InMemoryStore:
         self.next_run_id = 1
         self.sessions: dict[tuple[int, str], str] = {}
         self.current_project: dict[int, str] = {}
+        self.hidden_projects: dict[int, set[str]] = {}
         self.audit_log: list[dict] = []
 
     async def create_project_run(self, *, user_id: int, project_path: str, thread_id: str = "", first_prompt_preview: str = "") -> int:
@@ -349,6 +350,9 @@ class InMemoryStore:
             last_error="",
         )
 
+    async def clear_session(self, user_id: int, project_path: str) -> None:
+        self.sessions.pop((user_id, project_path), None)
+
     async def get_thread_id(self, user_id: int, project_path: str):
         return self.sessions.get((user_id, project_path))
 
@@ -376,6 +380,22 @@ class InMemoryStore:
             if project_path not in ordered:
                 ordered.append(project_path)
         return ordered[:limit]
+
+    async def list_hidden_projects(self, user_id: int) -> list[str]:
+        return sorted(self.hidden_projects.get(user_id, set()))
+
+    def list_hidden_projects_sync(self, user_id: int) -> list[str]:
+        return sorted(self.hidden_projects.get(user_id, set()))
+
+    async def is_project_hidden(self, user_id: int, project_path: str) -> bool:
+        return project_path in self.hidden_projects.get(user_id, set())
+
+    async def set_project_hidden_state(self, user_id: int, project_path: str, *, hidden: bool) -> None:
+        projects = self.hidden_projects.setdefault(user_id, set())
+        if hidden:
+            projects.add(project_path)
+        else:
+            projects.discard(project_path)
 
     async def log_audit_event(
         self,
@@ -471,10 +491,11 @@ async def test_start_command_returns_home_text_without_reply_keyboard(tmp_path: 
 
     reply = update.effective_message.replies[-1]
     assert "Быстрый доступ." in reply.text
-    assert "Проект: `" in reply.text
+    assert "Проект: <code>" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
+        ["settings:show"],
         ["action:new"],
         [f"repo:quick:{str((tmp_path / 'web').resolve())}", f"repo:quick:{str((tmp_path / 'api').resolve())}"],
         ["nav:repo"],
@@ -521,7 +542,7 @@ async def test_status_command_returns_diagnostic_status_without_keyboard(tmp_pat
 
     reply = update.effective_message.replies[-1]
     assert "thread-abc" in reply.text
-    assert "Режим: `Песочница`" in reply.text
+    assert "Режим: <code>Песочница</code>" in reply.text
     assert "5ч:" in reply.text
     assert "Неделя:" in reply.text
     assert "reply_markup" not in reply.kwargs or reply.kwargs["reply_markup"] is None
@@ -567,7 +588,7 @@ async def test_verbose_callback_updates_level_and_audits(
     await bot.handle_ui_callback(update, context)
 
     assert context.user_data["verbose_level"] == 2
-    assert "Текущий verbose level: `2`" in callback_query.edits[-1][0]
+    assert "Текущий verbose level: <code>2</code>" in callback_query.edits[-1][0]
     rows = await store.conn.execute_fetchall(
         "SELECT event_type FROM audit_log WHERE event_type = 'telegram_verbose_selected'"
     )
@@ -594,7 +615,7 @@ async def test_start_chat_callback_opens_chat_ready_screen(
     await bot.handle_ui_callback(update, context)
 
     assert "Проект:" in callback_query.edits[-1][0]
-    assert "Режим: `Песочница`" in callback_query.edits[-1][0]
+    assert "Режим: <code>Песочница</code>" in callback_query.edits[-1][0]
     assert "Отправь задачу сообщением." in callback_query.edits[-1][0]
     assert callback_query.edits[-1][1]["reply_markup"] is None
     assert any(event == "telegram_nav_start" for _, event, _ in fake_logger.events)
@@ -620,14 +641,41 @@ async def test_menu_command_opens_session_card(tmp_path: Path) -> None:
 
     reply = update.effective_message.replies[-1]
     assert "Быстрый доступ." in reply.text
-    assert "Режим: `Песочница`" in reply.text
+    assert "Режим: <code>Песочница</code>" in reply.text
     assert "Недавние: переключение в один тап." in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
+        ["settings:show"],
         ["action:new"],
         [f"repo:quick:{str(project_dir.resolve())}", f"repo:quick:{str(other_dir.resolve())}"],
         ["nav:repo"],
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_menu_command_shows_resume_action_when_project_has_saved_session(tmp_path: Path) -> None:
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    await store.upsert_session(42, str(project_dir), "resume-thread-123", last_status="success")
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    update = FakeUpdate(user_id=42, text="/menu")
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+
+    await bot.menu_command(update, context)
+
+    reply = update.effective_message.replies[-1]
+    assert "Быстрый старт: продолжить последнюю сессию в один тап." in reply.text
+    assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
+        ["nav:repo", "session:list"],
+        ["workspace:list", "mode:show"],
+        ["settings:show"],
+        ["session:resume_current", "action:new"],
     ]
     await store.close()
 
@@ -654,7 +702,7 @@ async def test_sessions_command_lists_project_sessions(tmp_path: Path) -> None:
 
     reply = update.effective_message.replies[-1]
     assert "Сессии." in reply.text
-    assert f"Проект: `{str(project_dir.resolve().parent / project_dir.resolve().name)}`" in reply.text
+    assert f"Проект: <code>{tmp_path.name}/app</code>" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
         ["session:select:old-session"],
         ["session:refresh", "action:new"],
@@ -690,11 +738,11 @@ async def test_session_select_callback_saves_thread_and_next_prompt_resumes(tmp_
     assert session.thread_id == "old-session"
     assert session.last_status == "selected"
     assert callback_query.answers[-1] == ("Сессия выбрана", False)
-    assert "Выбрана сессия `old-sess`." in callback_query.edits[-1][0]
+    assert "Выбрана сессия <code>old-sess</code>." in callback_query.edits[-1][0]
 
     status_update = FakeUpdate(user_id=42, text="/status")
     await bot.status_command(status_update, context)
-    assert "Thread ID: `old-session`" in status_update.effective_message.replies[-1].text
+    assert "Thread ID: <code>old-session</code>" in status_update.effective_message.replies[-1].text
 
     text_update = FakeUpdate(user_id=42, text="continue")
     text_update.effective_message = FakeMessage(text="continue", message_id=2)
@@ -738,6 +786,79 @@ async def test_manual_session_select_after_new_session_reset_is_allowed(tmp_path
     selected = await store.get_session(42, str(project_dir))
     assert selected is not None
     assert selected.thread_id == "old-session"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_current_session_callback_opens_chat_ready_screen(tmp_path: Path) -> None:
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    await store.upsert_session(42, str(project_dir), "resume-thread-123456", last_status="success")
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+    callback_query = FakeCallbackQuery(from_user_id=42, data="session:resume_current")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+
+    await bot.handle_ui_callback(update, context)
+
+    assert callback_query.answers[-1] == ("Продолжаем сессию", False)
+    assert "Продолжаем сессию <code>resume-t</code>" in callback_query.edits[-1][0]
+    assert "Отправь задачу сообщением." in callback_query.edits[-1][0]
+    assert callback_query.edits[-1][1]["reply_markup"] is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_current_session_callback_falls_back_to_new_session_when_store_is_empty(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    store = InMemoryStore()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+    callback_query = FakeCallbackQuery(from_user_id=42, data="session:resume_current")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+
+    await bot.handle_ui_callback(update, context)
+
+    assert callback_query.answers[-1] == ("Сохранённой сессии нет.", False)
+    assert "Новая сессия для <code>" in callback_query.edits[-1][0]
+    assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
+        ["nav:repo", "session:list"],
+        ["workspace:list", "mode:show"],
+        ["settings:show"],
+        ["action:new"],
+    ]
+    assert await store.get_session(42, str(project_dir)) is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_current_session_callback_respects_active_run_guard(tmp_path: Path) -> None:
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    store = InMemoryStore()
+    await store.upsert_session(42, str(project_dir), "resume-thread-123456", last_status="success")
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+    set_active_run(bot, user_id=42, project_path=str(project_dir))
+    callback_query = FakeCallbackQuery(from_user_id=42, data="session:resume_current")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+
+    await bot.handle_ui_callback(update, context)
+
+    assert callback_query.answers[-1][1] is True
+    assert "Достигнут лимит активных запусков" in callback_query.answers[-1][0]
+    assert callback_query.edits == []
     await store.close()
 
 
@@ -832,7 +953,7 @@ async def test_repo_new_command_creates_and_selects_project(tmp_path: Path) -> N
 
     reply = update.effective_message.replies[-1]
     project_dir = (tmp_path / "my-api").resolve()
-    assert f"Новый проект: `{str(project_dir.parent / project_dir.name)}`." in reply.text
+    assert f"Новый проект: <code>{tmp_path.name}/my-api</code>." in reply.text
     assert Path(context.user_data["current_directory"]).name == "my-api"
     assert (tmp_path / "my-api").is_dir()
     await store.close()
@@ -876,7 +997,7 @@ async def test_repo_select_callback_switches_directory_and_audits(
     await bot.handle_ui_callback(update, context)
 
     assert Path(context.user_data["current_directory"]).name == "web"
-    assert str(web_dir.parent / web_dir.name) in callback_query.edits[-1][0]
+    assert f"{tmp_path.name}/web" in callback_query.edits[-1][0]
     rows = await store.conn.execute_fetchall(
         "SELECT event_type FROM audit_log WHERE event_type = 'telegram_repo_selected'"
     )
@@ -904,7 +1025,7 @@ async def test_create_project_callback_uses_suffix_when_name_is_taken(
 
     assert Path(context.user_data["current_directory"]).name == "2026-04-18-project-2"
     created_dir = (tmp_path / "2026-04-18-project-2").resolve()
-    assert str(created_dir.parent / created_dir.name) in callback_query.edits[-1][0]
+    assert f"{tmp_path.name}/2026-04-18-project-2" in callback_query.edits[-1][0]
     await store.close()
 
 
@@ -999,7 +1120,7 @@ async def test_handle_text_writes_request_started_and_finished(
     assert stop_callback.endswith(":42")
     project_dir = (tmp_path / "2026-04-18-project").resolve()
     assert update.effective_message.replies[1].text == (
-        f"Проект: {str(project_dir.parent / project_dir.name)}\n\nWorking... 0s"
+        f"Проект: {tmp_path.name}/2026-04-18-project\n\nWorking... 0s"
     )
     assert update.effective_message.replies[-1].kwargs["parse_mode"] == "HTML"
     assert "Проект:" in update.effective_message.replies[-1].text
@@ -1030,8 +1151,8 @@ async def test_workspace_command_shows_project_summary(tmp_path: Path) -> None:
 
     reply = update.effective_message.replies[-1]
     assert "Сводка по проектам." in reply.text
-    assert "Активных процессов: `1`" in reply.text
-    assert "`app`" in reply.text
+    assert "Активных процессов: <code>1</code>" in reply.text
+    assert "<code>app</code>" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"])[0] == [
         f"run:attach:{run_id}",
         f"run:view:{run_id}",
@@ -1065,6 +1186,96 @@ async def test_run_attach_callback_selects_session_and_project(tmp_path: Path) -
     assert callback_query.answers[-1] == ("Сессия выбрана", False)
     assert store.current_project[42] == str(project_dir)
     assert any(event["event_type"] == "telegram_run_attached" for event in store.audit_log)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_idle_project_button_switches_project(tmp_path: Path) -> None:
+    api_dir = tmp_path / "cli-api"
+    web_dir = tmp_path / "web"
+    api_dir.mkdir()
+    web_dir.mkdir()
+    store = InMemoryStore()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    context = FakeContext()
+    context.user_data["current_directory"] = web_dir
+    await store.set_current_project(42, str(web_dir))
+
+    update = FakeUpdate(user_id=42, text="/workspace")
+    await bot.workspace_command(update, context)
+
+    reply = update.effective_message.replies[-1]
+    assert keyboard_callback_data(reply.kwargs["reply_markup"])[0] == [f"repo:select:{str(api_dir)}"]
+
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"repo:select:{str(api_dir)}")
+    callback_update = FakeUpdate(user_id=42, callback_query=callback_query)
+    await bot.handle_ui_callback(callback_update, context)
+
+    assert Path(context.user_data["current_directory"]).name == "cli-api"
+    assert callback_query.answers[-1] == ("Переключено: cli-api", False)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_detail_open_project_callback_uses_project_path_key(tmp_path: Path) -> None:
+    project_dir = tmp_path / "cli-api"
+    project_dir.mkdir()
+    store = InMemoryStore()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    run_id = await store.create_project_run(
+        user_id=42,
+        project_path=str(project_dir),
+        thread_id="thread-attach",
+        first_prompt_preview="Resume work",
+    )
+    await store.update_project_run(run_id, status="success", finished=True)
+
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"run:view:{run_id}")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+    context = FakeContext()
+
+    await bot.handle_ui_callback(update, context)
+
+    assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
+        ["run:attach:1"],
+        [f"repo:select:{str(project_dir)}"],
+        [f"run:list:{str(project_dir)}"],
+        ["workspace:list"],
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_detail_live_updates_while_process_is_active(tmp_path: Path) -> None:
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    bot.navigation_flow.run_detail_heartbeat_seconds = 0.01
+    run_id = await store.create_project_run(
+        user_id=42,
+        project_path=str(project_dir),
+        thread_id="thread-live",
+        first_prompt_preview="Resume work",
+    )
+
+    callback_query = FakeCallbackQuery(from_user_id=42, data=f"run:view:{run_id}")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+    context = FakeContext()
+
+    await bot.handle_ui_callback(update, context)
+    await store.update_project_run(run_id, last_progress_summary="🔧 ApplyPatch", tool_count=2)
+    await asyncio.sleep(0.03)
+    await store.update_project_run(run_id, status="success", finished=True)
+    await asyncio.sleep(0.03)
+
+    assert any("Последний шаг: 🔧 ApplyPatch" in text for text, _ in callback_query.edits)
+    assert "Статус: <code>success</code>" in callback_query.edits[-1][0]
+    assert bot.navigation_flow._live_run_detail_tasks == {}
     await store.close()
 
 
@@ -1128,10 +1339,11 @@ async def test_quick_repo_select_callback_switches_project_from_menu(tmp_path: P
 
     assert Path(context.user_data["current_directory"]).name == "web"
     assert callback_query.answers[-1] == ("Переключено: web", False)
-    assert f"Текущий проект: `{str(web_dir.parent / web_dir.name)}`." in callback_query.edits[-1][0]
+    assert "Текущий проект: <code>" in callback_query.edits[-1][0]
     assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
+        ["settings:show"],
         ["action:new"],
         [f"repo:quick:{str(web_dir)}", f"repo:quick:{str(api_dir)}"],
         ["nav:repo"],
@@ -1331,7 +1543,7 @@ async def test_handle_text_sends_typing_heartbeat_and_elapsed_progress(
     await bot.handle_text(update, context)
 
     progress_reply = update.effective_message.replies[0]
-    assert progress_reply.text == f"Проект: {str(project_dir.resolve().parent / project_dir.resolve().name)}\n\nWorking... 0s"
+    assert progress_reply.text == f"Проект: {tmp_path.name}/app\n\nWorking... 0s"
     assert progress_reply.progress.deleted is True
     await store.close()
 
@@ -1506,7 +1718,7 @@ async def test_voice_transcription_is_echoed_before_codex_run(tmp_path: Path) ->
     await bot.handle_voice(update, context)
 
     replies = update.effective_message.replies
-    assert replies[0].text == "Transcribing..."
+    assert replies[0].text == "Скачиваю голосовое сообщение..."
     assert replies[0].progress.deleted is True
     assert replies[1].text == "Транскрипция:\n\nhello from groq"
     assert bot.codex.calls[-1]["prompt"] == "Voice message transcription:\n\nhello from groq"
@@ -1625,12 +1837,12 @@ async def test_launch_mode_is_restored_per_project(tmp_path: Path) -> None:
     context.user_data["current_directory"] = api_dir
     menu_update = FakeUpdate(user_id=42, text="/menu")
     await bot.menu_command(menu_update, context)
-    assert "Режим: `Полный доступ`" in menu_update.effective_message.replies[-1].text
+    assert "Режим: <code>Полный доступ</code>" in menu_update.effective_message.replies[-1].text
 
     context.user_data["current_directory"] = web_dir
     menu_update = FakeUpdate(user_id=42, text="/menu")
     await bot.menu_command(menu_update, context)
-    assert "Режим: `Песочница`" in menu_update.effective_message.replies[-1].text
+    assert "Режим: <code>Песочница</code>" in menu_update.effective_message.replies[-1].text
     await store.close()
 
 
@@ -1649,7 +1861,7 @@ async def test_repo_command_switches_project_even_when_another_run_is_active(tmp
 
     assert Path(context.user_data["current_directory"]).name == "api"
     api_dir = (tmp_path / "api").resolve()
-    assert f"Текущий проект: `{str(api_dir.parent / api_dir.name)}`." in update.effective_message.replies[-1].text
+    assert "Текущий проект: <code>" in update.effective_message.replies[-1].text
     await store.close()
 
 
@@ -1669,8 +1881,8 @@ async def test_handle_text_rejects_second_run_while_first_is_active(tmp_path: Pa
     await bot.handle_text(update, context)
 
     assert update.effective_message.replies[-1].text == (
-        "Достигнут лимит активных запусков: `1/1`.\n\n"
-        "Открой `/workspace`, чтобы переключиться на один из процессов или остановить его."
+        "Достигнут лимит активных запусков: <code>1/1</code>.\n\n"
+        "Открой <code>/workspace</code>, чтобы переключиться на один из процессов или остановить его."
     )
     await store.close()
 
@@ -1700,7 +1912,7 @@ async def test_selected_project_is_restored_after_restart(tmp_path: Path) -> Non
 
     assert Path(restarted_context.user_data["current_directory"]).name == "web"
     web_dir = (tmp_path / "web").resolve()
-    assert f"Проект: `{str(web_dir.parent / web_dir.name)}`" in restarted_update.effective_message.replies[-1].text
+    assert f"Проект: <code>{tmp_path.name}/web</code>" in restarted_update.effective_message.replies[-1].text
     await restarted_store.close()
 
 
@@ -1731,10 +1943,10 @@ async def test_workspace_does_not_show_running_after_restart(tmp_path: Path) -> 
 
     reply = update.effective_message.replies[-1]
     assert "Активных процессов" not in reply.text
-    assert "`interrupted`" in reply.text
+    assert "<code>orphaned_after_restart</code>" in reply.text
     run = await restarted_store.get_project_run(run_id, user_id=42)
     assert run is not None
-    assert run.status == ProjectRunStatus.INTERRUPTED
+    assert run.status == ProjectRunStatus.ORPHANED_AFTER_RESTART
     await restarted_store.close()
 
 
@@ -1803,8 +2015,8 @@ async def test_handle_text_allows_up_to_five_active_runs_before_rejecting(tmp_pa
     await bot.handle_text(update, context)
 
     assert update.effective_message.replies[-1].text == (
-        "Достигнут лимит активных запусков: `5/5`.\n\n"
-        "Открой `/workspace`, чтобы переключиться на один из процессов или остановить его."
+        "Достигнут лимит активных запусков: <code>5/5</code>.\n\n"
+        "Открой <code>/workspace</code>, чтобы переключиться на один из процессов или остановить его."
     )
     await store.close()
 
@@ -1928,3 +2140,87 @@ async def test_amain_emits_startup_and_shutdown_logs(monkeypatch: pytest.MonkeyP
     assert "app_shutdown_started" in events
     assert "app_shutdown_completed" in events
     assert fake_store.finalized_orphaned_runs == 1
+
+
+@pytest.mark.asyncio
+async def test_health_command_reports_preflight_status(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(
+        tmp_path,
+        enable_voice_messages=True,
+        voice_provider="openai_compatible",
+        voice_api_key="key",
+        voice_api_base_url="https://api.groq.com/openai/v1",
+        voice_transcription_model="whisper-large-v3-turbo",
+    )
+    bot = CodexTelegramBot(settings, store)
+    update = FakeUpdate(user_id=42, text="/health")
+    context = FakeContext()
+
+    await bot.health_command(update, context)
+
+    reply = update.effective_message.replies[-1]
+    assert reply.kwargs["parse_mode"] == "HTML"
+    assert "Telecodex self-check" in reply.text
+    assert "SQLite: ok" in reply.text
+    assert "Codex CLI: ok" in reply.text
+    assert "Voice: ok" in reply.text
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ui_messages_use_html_renderer_for_workspace(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    project_dir = tmp_path / "api"
+    project_dir.mkdir()
+    await store.create_project_run(
+        user_id=42,
+        project_path=str(project_dir.resolve()),
+        thread_id="thread-123",
+        first_prompt_preview="Fix API",
+    )
+
+    update = FakeUpdate(user_id=42, text="/workspace")
+    context = FakeContext()
+
+    await bot.workspace_command(update, context)
+
+    reply = update.effective_message.replies[-1]
+    assert reply.kwargs["parse_mode"] == "HTML"
+    assert f"<code>{tmp_path.name}/api</code>" in reply.text
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_live_updates_while_process_is_active(tmp_path: Path) -> None:
+    project_dir = tmp_path / "api"
+    project_dir.mkdir()
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    bot.navigation_flow.workspace_heartbeat_seconds = 0.01
+    run_id = await store.create_project_run(
+        user_id=42,
+        project_path=str(project_dir.resolve()),
+        thread_id="thread-live",
+        first_prompt_preview="Fix API",
+    )
+
+    callback_query = FakeCallbackQuery(from_user_id=42, data="workspace:list")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+    context = FakeContext()
+
+    await bot.handle_ui_callback(update, context)
+    await store.update_project_run(run_id, last_progress_summary="🔧 ApplyPatch", tool_count=2)
+    await asyncio.sleep(0.03)
+    await store.update_project_run(run_id, status="success", finished=True)
+    await asyncio.sleep(0.03)
+
+    assert any("🔧 ApplyPatch" in text for text, _ in callback_query.edits)
+    assert bot.navigation_flow._live_workspace_tasks == {}
+    await store.close()

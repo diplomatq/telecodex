@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 from ..config import Settings
 from ..models import CodexResponse, RequestContext
 from ..session_store import SessionStore
+from ..telegram.ui.responder import TelegramResponder
 
 
 class ObservabilityService:
@@ -16,6 +17,7 @@ class ObservabilityService:
         self.settings = settings
         self.session_store = session_store
         self.logger = logger
+        self.responder = TelegramResponder(logger)
 
     async def ensure_authorized(self, update: Update, request_context: RequestContext) -> bool:
         if self.is_authorized(update):
@@ -28,7 +30,7 @@ class ObservabilityService:
             level="warning",
         )
         if update.effective_message:
-            await update.effective_message.reply_text("Access denied.")
+            await self.responder.send_ui_message(update=update, text="Access denied.")
         return False
 
     def is_authorized(self, update: Update) -> bool:

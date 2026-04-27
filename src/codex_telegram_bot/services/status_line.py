@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from ..config import Settings
 from ..models import CodexLaunchMode, CodexResponse
+from ..project_labels import render_project_display_name
 from ..processes import subprocess_group_kwargs, terminate_process_tree
 
 
@@ -137,7 +138,7 @@ class StatusLineRenderer:
         )
 
         values = {
-            "project": cwd.name if cwd is not None else UNKNOWN,
+            "project": render_project_display_name(cwd) if cwd is not None else UNKNOWN,
             "cwd": str(cwd) if cwd is not None else UNKNOWN,
             "cwd_basename": cwd.name if cwd is not None else UNKNOWN,
             "model": self.settings.codex_model or "default",

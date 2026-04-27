@@ -9,6 +9,7 @@ from telegram import Update
 from ..config import Settings
 from ..models import PreparedCodexRequest, ProcessedDocument, ProcessedImage
 from ..services.observability import ObservabilityService
+from ..telegram.ui.responder import TelegramResponder
 from ..voice import VoiceTranscriber
 
 
@@ -24,6 +25,7 @@ class MessageInputPreparer:
         self.voice = voice
         self.observability = observability
         self.logger = logger
+        self.responder = TelegramResponder(logger)
 
     def prepare_text(self, message_text: str) -> PreparedCodexRequest:
         return PreparedCodexRequest(prompt=message_text, source="text")
@@ -41,9 +43,7 @@ class MessageInputPreparer:
                 audit_event="unsupported_input",
                 event_status="document_disabled",
             )
-            await update.effective_message.reply_text(
-                "File uploads are disabled.",
-            )
+            await self.responder.send_ui_message(update=update, text="File uploads are disabled.")
             return None
 
         tg_file = await document.get_file()
@@ -58,8 +58,9 @@ class MessageInputPreparer:
                 audit_event="unsupported_input",
                 event_status="document_not_utf8",
             )
-            await update.effective_message.reply_text(
-                "Поддерживаются только текстовые файлы UTF-8.",
+            await self.responder.send_ui_message(
+                update=update,
+                text="Поддерживаются только текстовые файлы UTF-8.",
             )
             return None
 
@@ -90,22 +91,25 @@ class MessageInputPreparer:
                 audit_event="unsupported_input",
                 event_status="voice_disabled",
             )
-            await update.effective_message.reply_text(
-                "Voice messages are disabled.",
-            )
+            await self.responder.send_ui_message(update=update, text="Voice messages are disabled.")
             return None
 
-        progress = await update.effective_message.reply_text("Transcribing...")
+        progress = await self.responder.send_ui_message(
+            update=update,
+            text="Скачиваю голосовое сообщение...",
+        )
         await self.observability.record_event("voice_transcription_started", request_context)
         try:
+            await progress.edit_text("Транскрибирую...")
             processed = await self.voice.transcribe(
                 update.effective_message.voice,
                 caption=update.effective_message.caption,
             )
             request_context.prompt_chars = len(processed.prompt)
             await progress.delete()
-            await update.effective_message.reply_text(
-                f"Транскрипция:\n\n{processed.transcription}"
+            await self.responder.send_ui_message(
+                update=update,
+                text=f"Транскрипция:\n\n{processed.transcription}",
             )
             return PreparedCodexRequest(prompt=processed.prompt, source="voice")
         except Exception as exc:
@@ -132,8 +136,9 @@ class MessageInputPreparer:
                 audit_event="unsupported_input",
                 event_status="image_disabled",
             )
-            await update.effective_message.reply_text(
-                "Image support is disabled. Enable CODEX_ENABLE_IMAGES=true.",
+            await self.responder.send_ui_message(
+                update=update,
+                text="Image support is disabled. Enable CODEX_ENABLE_IMAGES=true.",
             )
             return None
 

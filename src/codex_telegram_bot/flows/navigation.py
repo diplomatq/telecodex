@@ -19,8 +19,10 @@ from ..telegram.ui.keyboards import (
     build_local_sessions_keyboard,
     build_no_project_keyboard,
     build_project_runs_keyboard,
+    build_project_visibility_keyboard,
     build_repo_keyboard,
     build_run_detail_keyboard,
+    build_settings_keyboard,
     build_session_keyboard,
     build_verbose_keyboard,
     build_workspace_keyboard,
@@ -33,9 +35,11 @@ from ..telegram.ui.texts import (
     render_project_runs_text,
     render_project_created_text,
     render_project_selected_text,
+    render_project_visibility_text,
     render_repo_picker_text,
     render_run_detail_text,
     render_session_text,
+    render_settings_text,
     render_start_chat_text,
     render_status_text,
     render_verbose_text,
@@ -46,6 +50,8 @@ from ..telegram.ui.texts import (
 
 class NavigationFlow:
     ACTIVE_RUN_MESSAGE = PromptExecutionFlow.ACTIVE_RUN_MESSAGE
+    PROJECT_VISIBILITY_PAGE_KEY = "settings_project_visibility_page"
+    WORKSPACE_PAGE_KEY = "workspace_page"
 
     def __init__(
         self,
@@ -62,6 +68,192 @@ class NavigationFlow:
         self.observability = observability
         self.responder = responder
         self.execution = execution
+        self.run_detail_heartbeat_seconds = 2.0
+        self._live_run_detail_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self.workspace_heartbeat_seconds = 2.0
+        self._live_workspace_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+
+    @staticmethod
+    def _live_run_detail_message_key(update: Update) -> tuple[int, int] | None:
+        query = update.callback_query
+        if query is None or query.message is None or update.effective_chat is None:
+            return None
+        chat_id = getattr(update.effective_chat, "id", None)
+        message_id = getattr(query.message, "message_id", None)
+        if chat_id is None or message_id is None:
+            return None
+        return (int(chat_id), int(message_id))
+
+    def cancel_live_run_detail_monitor(self, update: Update) -> None:
+        message_key = self._live_run_detail_message_key(update)
+        if message_key is None:
+            return
+        task = self._live_run_detail_tasks.pop(message_key, None)
+        if task is not None:
+            task.cancel()
+
+    def cancel_live_workspace_monitor(self, update: Update) -> None:
+        message_key = self._live_run_detail_message_key(update)
+        if message_key is None:
+            return
+        task = self._live_workspace_tasks.pop(message_key, None)
+        if task is not None:
+            task.cancel()
+
+    def _start_live_workspace_monitor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        page: int,
+    ) -> None:
+        message_key = self._live_run_detail_message_key(update)
+        if message_key is None:
+            return
+        self.cancel_live_workspace_monitor(update)
+        task = asyncio.create_task(
+            self._live_workspace_monitor(
+                update,
+                context,
+                request_context,
+                page=page,
+                message_key=message_key,
+            )
+        )
+        self._live_workspace_tasks[message_key] = task
+        task.add_done_callback(lambda completed, key=message_key: self._clear_live_workspace_task(key, completed))
+
+    def _clear_live_workspace_task(
+        self,
+        message_key: tuple[int, int],
+        task: asyncio.Task[None],
+    ) -> None:
+        current = self._live_workspace_tasks.get(message_key)
+        if current is task:
+            self._live_workspace_tasks.pop(message_key, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.responder.logger.debug("telegram_workspace_live_refresh_failed", error=str(exc))
+
+    async def _live_workspace_monitor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        page: int,
+        message_key: tuple[int, int],
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.workspace_heartbeat_seconds)
+            if self._live_workspace_tasks.get(message_key) is not asyncio.current_task():
+                return
+            project = await self.projects.resolve_current_project(context, request_context=request_context)
+            project_paths = self.projects.list_project_path_strings(
+                user_id=request_context.user_id if request_context is not None else None
+            )
+            summaries = await self.session_store.list_project_activity_summaries(
+                user_id=update.effective_user.id,
+                project_paths=project_paths,
+                current_project_path=str(project.path) if project.path is not None else "",
+            )
+            active_run_count = max(
+                self.execution.active_run_count(update.effective_user.id),
+                sum(1 for summary in summaries if summary.active_run is not None),
+            )
+            text = render_workspace_text(
+                summaries,
+                active_run_count=active_run_count,
+                active_run_limit=self.settings.max_active_runs_per_user,
+                page=page,
+            )
+            reply_markup = build_no_project_keyboard() if not summaries else build_workspace_keyboard(summaries, page=page)
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            if not any(summary.active_run is not None for summary in summaries):
+                return
+
+    def _start_live_run_detail_monitor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        run_id: int,
+    ) -> None:
+        message_key = self._live_run_detail_message_key(update)
+        if message_key is None:
+            return
+        self.cancel_live_run_detail_monitor(update)
+        task = asyncio.create_task(
+            self._live_run_detail_monitor(
+                update,
+                context,
+                request_context,
+                run_id=run_id,
+                message_key=message_key,
+            )
+        )
+        self._live_run_detail_tasks[message_key] = task
+        task.add_done_callback(lambda completed, key=message_key: self._clear_live_run_detail_task(key, completed))
+
+    def _clear_live_run_detail_task(
+        self,
+        message_key: tuple[int, int],
+        task: asyncio.Task[None],
+    ) -> None:
+        current = self._live_run_detail_tasks.get(message_key)
+        if current is task:
+            self._live_run_detail_tasks.pop(message_key, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.responder.logger.debug("telegram_run_detail_live_refresh_failed", error=str(exc))
+
+    async def _live_run_detail_monitor(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        run_id: int,
+        message_key: tuple[int, int],
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.run_detail_heartbeat_seconds)
+            if self._live_run_detail_tasks.get(message_key) is not asyncio.current_task():
+                return
+            run = await self.session_store.get_project_run(run_id, user_id=update.effective_user.id)
+            if run is None:
+                return
+            current_thread_id = await self.session_store.get_thread_id(
+                update.effective_user.id,
+                run.project_path,
+            )
+            current_project = await self.projects.resolve_current_project(
+                context,
+                request_context=request_context,
+            )
+            text = render_run_detail_text(
+                run,
+                current_session_thread_id=current_thread_id or "",
+                is_current_project=(
+                    str(current_project.path) == run.project_path if current_project.path else False
+                ),
+            )
+            reply_markup = build_run_detail_keyboard(
+                run,
+                user_id=update.effective_user.id,
+                attach_enabled=bool(run.thread_id and run.thread_id != (current_thread_id or "")),
+            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            if not run.is_active:
+                return
 
     async def _resolve_launch_mode(self, user_id: int, cwd) -> CodexLaunchMode:
         if cwd is None:
@@ -109,26 +301,21 @@ class NavigationFlow:
                     update.effective_user.id,
                     str(project.path),
                 ),
+                has_resume_session=bool(session and session.thread_id),
                 recent_project_count=len(recent_projects),
                 active_run_count=active_run_count,
                 active_run_limit=self.settings.max_active_runs_per_user,
                 auto_created=project.auto_created,
                 notice=notice,
             )
-            reply_markup = build_session_keyboard(recent_projects)
-        if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
+            reply_markup = build_session_keyboard(
+                recent_projects,
+                has_resume_session=bool(session and session.thread_id),
             )
+        if edit:
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def show_sessions(
         self,
@@ -174,18 +361,9 @@ class NavigationFlow:
             )
             reply_markup = build_local_sessions_keyboard(sessions)
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def select_session_from_callback(
         self,
@@ -200,11 +378,10 @@ class NavigationFlow:
         project = await self.projects.resolve_current_project(context, request_context=request_context)
         if project.path is None:
             await query.answer("Сначала выбери проект.", show_alert=True)
-            await self.responder.edit_callback_message(
+            await self.responder.edit_ui_message(
                 update,
                 render_no_projects_text(),
                 reply_markup=build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             return
         if self.execution.has_active_run_for_project(user_id, str(project.path)):
@@ -253,18 +430,22 @@ class NavigationFlow:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         request_context,
+        *,
+        notice: str = "",
     ) -> None:
         project = await self.projects.resolve_current_project(context, request_context=request_context)
         launch_mode = await self._resolve_launch_mode(update.effective_user.id, project.path)
-        await self.responder.edit_callback_message(
+        text = render_start_chat_text(
+            project.path,
+            auto_created=project.auto_created,
+            launch_mode=launch_mode,
+        )
+        if notice:
+            text = f"{notice}\n\n{text}"
+        await self.responder.edit_ui_message(
             update,
-            render_start_chat_text(
-                project.path,
-                auto_created=project.auto_created,
-                launch_mode=launch_mode,
-            ),
+            text,
             reply_markup=build_no_project_keyboard() if project.path is None else None,
-            parse_mode="Markdown",
         )
 
     async def start_new_session(
@@ -279,17 +460,16 @@ class NavigationFlow:
         if project.path is None:
             text = "Сначала создай проект."
             if edit:
-                await self.responder.edit_callback_message(
+                await self.responder.edit_ui_message(
                     update,
                     text,
                     reply_markup=build_no_project_keyboard(),
-                    parse_mode="Markdown",
                 )
             else:
-                await update.effective_message.reply_text(
-                    text,
+                await self.responder.send_ui_message(
+                    update=update,
+                    text=text,
                     reply_markup=build_no_project_keyboard(),
-                    parse_mode="Markdown",
                 )
             return
         if self.execution.has_active_run_for_project(update.effective_user.id, str(project.path)):
@@ -297,13 +477,48 @@ class NavigationFlow:
             if update.callback_query is not None:
                 await update.callback_query.answer(limit_message, show_alert=True)
             else:
-                await update.effective_message.reply_text(limit_message, parse_mode="Markdown")
+                await self.responder.send_ui_message(update=update, text=limit_message)
             return
 
         cwd = project.path
         await self.session_store.clear_session(update.effective_user.id, str(cwd))
         notice = f"Новая сессия для `{render_project_display_name(cwd)}` готова."
         await self.show_menu(update, context, request_context, edit=edit, notice=notice)
+
+    async def resume_current_session(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+    ) -> None:
+        query = update.callback_query
+        project = await self.projects.resolve_current_project(context, request_context=request_context)
+        if project.path is None:
+            await query.answer("Сначала выбери проект.", show_alert=True)
+            await self.responder.edit_ui_message(
+                update,
+                render_no_projects_text(),
+                reply_markup=build_no_project_keyboard(),
+            )
+            return
+        if self.execution.has_active_run_for_project(update.effective_user.id, str(project.path)):
+            await query.answer(
+                self.execution.render_active_run_limit_message(update.effective_user.id),
+                show_alert=True,
+            )
+            return
+        session = await self.session_store.get_session(update.effective_user.id, str(project.path))
+        if session is None or not session.thread_id:
+            await query.answer("Сохранённой сессии нет.")
+            await self.start_new_session(update, context, request_context, edit=True)
+            return
+        await query.answer("Продолжаем сессию")
+        await self.show_start_chat(
+            update,
+            context,
+            request_context,
+            notice=f"Продолжаем сессию `{session.thread_id[:8]}` для проекта `{render_project_display_name(project.path)}`.",
+        )
 
     async def show_status(
         self,
@@ -355,18 +570,9 @@ class NavigationFlow:
             text = f"{text}\n\n{status_line}"
         reply_markup = build_no_project_keyboard() if cwd is None else None
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def show_verbose(
         self,
@@ -379,18 +585,9 @@ class NavigationFlow:
         text = render_verbose_text(current)
         reply_markup = build_verbose_keyboard(current)
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def set_verbose(
         self,
@@ -408,11 +605,10 @@ class NavigationFlow:
             previous_verbose_level=previous_level,
             new_verbose_level=level,
         )
-        await self.responder.edit_callback_message(
+        await self.responder.edit_ui_message(
             update,
             render_verbose_text(level),
             reply_markup=build_verbose_keyboard(level),
-            parse_mode="Markdown",
         )
 
     async def handle_repo_command(
@@ -426,10 +622,10 @@ class NavigationFlow:
         args = command_text.split()[1:]
         if args and args[0] == "new":
             if len(args) < 2:
-                await update.effective_message.reply_text(
-                    "Используй `/repo new <name>` или кнопку `➕ Создать проект`.",
+                await self.responder.send_ui_message(
+                    update=update,
+                    text="Используй `/repo new <name>` или кнопку `➕ Создать проект`.",
                     reply_markup=build_no_project_keyboard(),
-                    parse_mode="Markdown",
                 )
                 return
             try:
@@ -439,10 +635,10 @@ class NavigationFlow:
                     request_context=request_context,
                 )
             except Exception as exc:
-                await update.effective_message.reply_text(
-                    f"Не удалось создать проект: {exc}",
+                await self.responder.send_ui_message(
+                    update=update,
+                    text=f"Не удалось создать проект: {exc}",
                     reply_markup=build_no_project_keyboard(),
-                    parse_mode="Markdown",
                 )
                 return
             await self.show_menu(
@@ -454,12 +650,15 @@ class NavigationFlow:
             return
         if args:
             try:
-                candidate = self.projects.resolve_repo_slug(args[0])
+                candidate = self.projects.resolve_repo_slug(
+                    args[0],
+                    user_id=request_context.user_id if request_context is not None else None,
+                )
             except (FileNotFoundError, NotADirectoryError, PermissionError):
-                await update.effective_message.reply_text(
-                    f"Проект не найден: `{args[0]}`",
+                await self.responder.send_ui_message(
+                    update=update,
+                    text=f"Проект не найден: `{args[0]}`",
                     reply_markup=build_navigation_keyboard(),
-                    parse_mode="Markdown",
                 )
                 return
             context.user_data["current_directory"] = candidate
@@ -483,7 +682,10 @@ class NavigationFlow:
         edit: bool,
     ) -> None:
         project = await self.projects.resolve_current_project(context, request_context=request_context)
-        options, truncated = self.projects.list_repo_options(context)
+        options, truncated = self.projects.list_repo_options(
+            context,
+            user_id=request_context.user_id if request_context is not None else None,
+        )
         await self.observability.record_event(
             "telegram_repo_picker_opened",
             request_context,
@@ -499,18 +701,9 @@ class NavigationFlow:
             reply_markup = build_repo_keyboard(options)
 
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def create_project_from_callback(
         self,
@@ -528,11 +721,10 @@ class NavigationFlow:
             )
         except Exception as exc:
             await query.answer("Create failed.", show_alert=True)
-            await self.responder.edit_callback_message(
+            await self.responder.edit_ui_message(
                 update,
                 f"Не удалось создать проект: `{str(exc)[:160]}`",
                 reply_markup=build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             return
         await query.answer(f"Создан {project.name}")
@@ -551,10 +743,14 @@ class NavigationFlow:
         request_context,
         *,
         edit: bool = False,
+        page: int = 0,
         notice: str = "",
     ) -> None:
+        context.user_data[self.WORKSPACE_PAGE_KEY] = max(page, 0)
         project = await self.projects.resolve_current_project(context, request_context=request_context)
-        project_paths = self.projects.list_project_path_strings()
+        project_paths = self.projects.list_project_path_strings(
+            user_id=request_context.user_id if request_context is not None else None
+        )
         summaries = await self.session_store.list_project_activity_summaries(
             user_id=update.effective_user.id,
             project_paths=project_paths,
@@ -576,17 +772,100 @@ class NavigationFlow:
             notice=notice,
             active_run_count=active_run_count,
             active_run_limit=self.settings.max_active_runs_per_user,
+            page=page,
         )
-        reply_markup = build_no_project_keyboard() if not summaries else build_workspace_keyboard(summaries)
+        reply_markup = build_no_project_keyboard() if not summaries else build_workspace_keyboard(summaries, page=page)
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            if update.callback_query is not None and any(summary.active_run is not None for summary in summaries):
+                self._start_live_workspace_monitor(update, context, request_context, page=page)
             return
-        await update.effective_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
+
+    async def show_settings(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        edit: bool = True,
+        notice: str = "",
+    ) -> None:
+        project = await self.projects.resolve_current_project(
+            context,
+            request_context=request_context,
+            create_if_empty=False,
+        )
+        text = render_settings_text(current_project=project.path, notice=notice)
+        reply_markup = build_settings_keyboard()
+        if edit:
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            return
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
+
+    async def show_project_visibility_settings(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        *,
+        edit: bool = True,
+        page: int = 0,
+        notice: str = "",
+    ) -> None:
+        context.user_data[self.PROJECT_VISIBILITY_PAGE_KEY] = max(page, 0)
+        project = await self.projects.resolve_current_project(
+            context,
+            request_context=request_context,
+            create_if_empty=False,
+        )
+        entries = await self.projects.list_project_visibility_options(
+            user_id=update.effective_user.id,
+            current_project_path=project.path,
+        )
+        text = render_project_visibility_text(entries, page=page, notice=notice)
+        reply_markup = build_project_visibility_keyboard(entries, page=page)
+        if edit:
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            return
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
+
+    async def set_project_visibility_from_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        project_key: str,
+        *,
+        hidden: bool,
+    ) -> None:
+        query = update.callback_query
+        page = int(context.user_data.get(self.PROJECT_VISIBILITY_PAGE_KEY, 0))
+        try:
+            project_path = self.projects.resolve_repo_key(
+                project_key,
+                user_id=update.effective_user.id,
+                include_hidden=True,
+            )
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            await query.answer("Проект недоступен.", show_alert=True)
+            await self.show_project_visibility_settings(update, context, request_context, edit=True)
+            return
+        await self.projects.set_project_hidden_state(
+            user_id=update.effective_user.id,
+            project_path=project_path,
+            hidden=hidden,
+        )
+        action_text = "скрыт" if hidden else "показан"
+        await query.answer(f"Проект {action_text}")
+        await self.show_project_visibility_settings(
+            update,
+            context,
+            request_context,
+            edit=True,
+            page=page,
+            notice=f"Проект `{render_project_display_name(project_path)}` {action_text}.",
+        )
 
     async def show_project_runs(
         self,
@@ -598,7 +877,11 @@ class NavigationFlow:
         edit: bool = True,
         notice: str = "",
     ) -> None:
-        project_path = self.projects.resolve_repo_key(project_slug)
+        project_path = self.projects.resolve_repo_key(
+            project_slug,
+            user_id=update.effective_user.id,
+            include_hidden=True,
+        )
         runs = await self.session_store.list_project_runs(
             user_id=update.effective_user.id,
             project_path=str(project_path),
@@ -614,16 +897,11 @@ class NavigationFlow:
             current_thread_id=current_thread_id or "",
             notice=notice,
         )
-        reply_markup = build_project_runs_keyboard(project_path.name, runs)
+        reply_markup = build_project_runs_keyboard(str(project_path), runs)
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
             return
-        await update.effective_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def show_run_detail(
         self,
@@ -641,7 +919,7 @@ class NavigationFlow:
                 await update.callback_query.answer("Процесс не найден.", show_alert=True)
                 await self.show_workspace(update, context, request_context, edit=True)
             else:
-                await update.effective_message.reply_text("Процесс не найден.")
+                await self.responder.send_ui_message(update=update, text="Процесс не найден.")
             return
         current_thread_id = await self.session_store.get_thread_id(update.effective_user.id, run.project_path)
         current_project = await self.projects.resolve_current_project(context, request_context=request_context)
@@ -657,14 +935,16 @@ class NavigationFlow:
             attach_enabled=bool(run.thread_id and run.thread_id != (current_thread_id or "")),
         )
         if edit:
-            await self.responder.edit_callback_message(
-                update,
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
+            await self.responder.edit_ui_message(update, text, reply_markup=reply_markup)
+            if run.is_active and update.callback_query is not None:
+                self._start_live_run_detail_monitor(
+                    update,
+                    context,
+                    request_context,
+                    run_id=run_id,
+                )
             return
-        await update.effective_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
     async def attach_run_to_project(
         self,
@@ -720,15 +1000,20 @@ class NavigationFlow:
         )
         previous_dir = current_resolution.path or self.settings.approved_directory.resolve()
         try:
-            selected_dir = self.projects.resolve_repo_key(slug)
+            selected_dir = self.projects.resolve_repo_key(
+                slug,
+                user_id=update.effective_user.id,
+            )
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             await query.answer("Project unavailable.", show_alert=True)
-            options, truncated = self.projects.list_repo_options(context)
-            await self.responder.edit_callback_message(
+            options, truncated = self.projects.list_repo_options(
+                context,
+                user_id=request_context.user_id if request_context is not None else None,
+            )
+            await self.responder.edit_ui_message(
                 update,
                 render_repo_picker_text(options, truncated) if options else render_no_projects_text(),
                 reply_markup=build_repo_keyboard(options) if options else build_no_project_keyboard(),
-                parse_mode="Markdown",
             )
             return
         context.user_data["current_directory"] = selected_dir
@@ -764,7 +1049,10 @@ class NavigationFlow:
         )
         previous_dir = current_resolution.path or self.settings.approved_directory.resolve()
         try:
-            selected_dir = self.projects.resolve_repo_key(slug)
+            selected_dir = self.projects.resolve_repo_key(
+                slug,
+                user_id=update.effective_user.id,
+            )
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             await query.answer("Проект недоступен.", show_alert=True)
             await self.show_menu(
