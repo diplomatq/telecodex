@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from codex_telegram_bot.config import Settings
 from codex_telegram_bot.models import CodexLaunchMode, CodexResponse, CodexResultStatus
-from codex_telegram_bot.services.status_line import CodexLimitStatus, StatusLineRenderer
+from codex_telegram_bot.services.status_line import (
+    CodexLimitStatus,
+    CodexLimitStatusProvider,
+    StatusLineRenderer,
+)
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
@@ -152,3 +158,42 @@ def test_status_line_renderer_uses_context_from_limit_status(tmp_path: Path) -> 
     )
 
     assert line == "30/40/80/120"
+
+
+@pytest.mark.asyncio
+async def test_limit_status_provider_cache_is_scoped_to_project_and_thread(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        status_line_limits_prompt="",
+        status_line_limits_refresh_seconds=300,
+    )
+    provider = CodexLimitStatusProvider(settings)
+    api_dir = tmp_path / "api"
+    web_dir = tmp_path / "web"
+    api_dir.mkdir()
+    web_dir.mkdir()
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_read_latest_local_status(*, cwd: Path | None, thread_id: str):
+        resolved = str((cwd or settings.approved_directory).resolve())
+        calls.append((resolved, thread_id))
+        if resolved == str(api_dir.resolve()):
+            return CodexLimitStatus(limit_5h="api", updated_at="2026-04-28T10:00:00+00:00")
+        return CodexLimitStatus(limit_5h="web", updated_at="2026-04-28T10:05:00+00:00")
+
+    provider._read_latest_local_status = fake_read_latest_local_status  # type: ignore[method-assign]
+
+    api_first = await provider.get_status(cwd=api_dir, thread_id="thread-api")
+    api_second = await provider.get_status(cwd=api_dir, thread_id="thread-api")
+    web_first = await provider.get_status(cwd=web_dir, thread_id="thread-web")
+    web_second = await provider.get_status(cwd=web_dir, thread_id="thread-web")
+
+    assert api_first.limit_5h == "api"
+    assert api_second.limit_5h == "api"
+    assert web_first.limit_5h == "web"
+    assert web_second.limit_5h == "web"
+    assert calls == [
+        (str(api_dir.resolve()), "thread-api"),
+        (str(web_dir.resolve()), "thread-web"),
+    ]

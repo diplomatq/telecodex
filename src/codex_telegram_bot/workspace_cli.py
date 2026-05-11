@@ -130,12 +130,12 @@ def _run_sync(argv: list[str] | None = None) -> int:
                     return 1
                 conn.execute(
                     """
-                    INSERT INTO project_sessions (user_id, project_path, thread_id, updated_at, last_status, last_error)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, '')
+                    INSERT INTO project_sessions (user_id, project_path, thread_id, title, updated_at, last_status, last_error)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, '')
                     ON CONFLICT(user_id, project_path)
-                    DO UPDATE SET thread_id=excluded.thread_id, updated_at=CURRENT_TIMESTAMP, last_status=excluded.last_status
+                    DO UPDATE SET thread_id=excluded.thread_id, title=excluded.title, updated_at=CURRENT_TIMESTAMP, last_status=excluded.last_status
                     """,
-                    (user_id, run.project_path, run.thread_id, "selected"),
+                    (user_id, run.project_path, run.thread_id, "", "selected"),
                 )
                 conn.execute(
                     """
@@ -234,6 +234,7 @@ def _ensure_schema(db_path: Path) -> None:
                 user_id INTEGER NOT NULL,
                 project_path TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_status TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',

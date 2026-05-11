@@ -108,6 +108,7 @@ class ProjectSession:
     project_path: str
     thread_id: str
     updated_at: str
+    title: str = ""
     last_status: str = ""
     last_error: str = ""
 
@@ -120,6 +121,23 @@ class LocalCodexSession:
     updated_at: datetime
     source_path: Path
     first_prompt: str = ""
+    title: str = ""
+
+
+@dataclass
+class SessionTranscriptEntry:
+    role: str
+    text: str
+
+
+@dataclass
+class SessionTranscript:
+    session_id: str
+    cwd: Path
+    source_path: Path
+    title: str = ""
+    entries: list[SessionTranscriptEntry] = field(default_factory=list)
+    truncated: bool = False
 
 
 @dataclass
@@ -154,6 +172,7 @@ class ProjectActivitySummary:
     project_name: str
     is_current: bool
     current_session_thread_id: str = ""
+    current_session_title: str = ""
     active_run: Optional[ProjectRun] = None
     latest_run: Optional[ProjectRun] = None
     recent_run_count: int = 0

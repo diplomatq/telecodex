@@ -205,6 +205,7 @@ class CodexLimitStatusProvider:
             else float(self.settings.status_line_limits_timeout_seconds)
         )
         self._cache: Optional[CodexLimitStatus] = None
+        self._cache_key: Optional[tuple[str, str]] = None
         self._cache_monotonic = 0.0
         self._lock = asyncio.Lock()
 
@@ -214,14 +215,15 @@ class CodexLimitStatusProvider:
         cwd: Optional[Path] = None,
         thread_id: str = "",
     ) -> CodexLimitStatus:
+        cache_key = self._cache_identity(cwd=cwd, thread_id=thread_id)
         now = time.monotonic()
-        if self._is_cache_fresh(now):
+        if self._is_cache_fresh(now, cache_key):
             assert self._cache is not None
             return self._cache
 
         async with self._lock:
             now = time.monotonic()
-            if self._is_cache_fresh(now):
+            if self._is_cache_fresh(now, cache_key):
                 assert self._cache is not None
                 return self._cache
 
@@ -230,18 +232,24 @@ class CodexLimitStatusProvider:
                     cwd=cwd,
                     thread_id=thread_id,
                 ) or CodexLimitStatus()
+                self._cache_key = cache_key
                 self._cache_monotonic = now
                 return self._cache
 
             self._cache = await self._refresh(cwd=cwd, thread_id=thread_id)
+            self._cache_key = cache_key
             self._cache_monotonic = time.monotonic()
             return self._cache
 
-    def _is_cache_fresh(self, now: float) -> bool:
-        if self._cache is None:
+    def _is_cache_fresh(self, now: float, cache_key: tuple[str, str]) -> bool:
+        if self._cache is None or self._cache_key != cache_key:
             return False
         refresh_seconds = self.settings.status_line_limits_refresh_seconds
         return refresh_seconds > 0 and now - self._cache_monotonic < refresh_seconds
+
+    def _cache_identity(self, *, cwd: Optional[Path], thread_id: str) -> tuple[str, str]:
+        resolved_cwd = str((cwd or self.settings.approved_directory).expanduser().resolve())
+        return (resolved_cwd, thread_id.strip())
 
     async def _refresh(self, *, cwd: Optional[Path], thread_id: str) -> CodexLimitStatus:
         try:

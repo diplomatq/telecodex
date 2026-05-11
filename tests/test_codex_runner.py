@@ -453,9 +453,83 @@ def test_discover_local_sessions_lists_matching_cwd_sorted_and_ignores_bad_jsonl
 
     assert [session.session_id for session in sessions] == ["newer-session", "older-session"]
     assert sessions[0].first_prompt == "Continue old Codex chat"
+    assert sessions[0].title == "Continue old Codex chat"
     assert sessions[1].first_prompt == "Implement manual session picker"
+    assert sessions[1].title == "Implement manual session picker"
     assert sessions[0].source_path == newer
     assert runner.discover_local_sessions(project_dir, limit=1)[0].session_id == "newer-session"
+
+
+def test_build_session_title_limits_to_first_five_words(tmp_path: Path) -> None:
+    runner = CodexRunner(make_settings(tmp_path))
+
+    title = runner.build_session_title("Please fix the Telegram callback routing regression today")
+
+    assert title == "Please fix the Telegram callback"
+
+
+def test_load_session_transcript_reads_user_and_assistant_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    sessions_dir = codex_home / "sessions" / "2026" / "04" / "28"
+    sessions_dir.mkdir(parents=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    session_file = sessions_dir / "session.jsonl"
+    session_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "session-1",
+                            "cwd": str(project_dir),
+                            "timestamp": "2026-04-28T10:00:00Z",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Please fix the Telegram callback routing regression today"},
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "I will inspect the callback flow and patch it."},
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    runner = CodexRunner(make_settings(tmp_path))
+    transcript = runner.load_session_transcript(project_dir, "session-1")
+
+    assert transcript is not None
+    assert transcript.title == "Please fix the Telegram callback"
+    assert [(entry.role, entry.text) for entry in transcript.entries] == [
+        ("user", "Please fix the Telegram callback routing regression today"),
+        ("assistant", "I will inspect the callback flow and patch it."),
+    ]
 
 
 @pytest.mark.asyncio

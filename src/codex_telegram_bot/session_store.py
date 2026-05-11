@@ -138,6 +138,9 @@ class SessionStore:
         if current_version < 9:
             await self._migration_v9()
             await self._set_schema_version(9)
+        if current_version < 10:
+            await self._migration_v10()
+            await self._set_schema_version(10)
 
     async def _get_schema_version(self) -> int:
         conn = self._require_conn()
@@ -157,6 +160,7 @@ class SessionStore:
                 user_id INTEGER NOT NULL,
                 project_path TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_status TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
@@ -207,6 +211,10 @@ class SessionStore:
         if "last_error" not in columns:
             await conn.execute(
                 "ALTER TABLE project_sessions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"
+            )
+        if "title" not in columns:
+            await conn.execute(
+                "ALTER TABLE project_sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
             )
         await conn.execute(
             """
@@ -369,6 +377,14 @@ class SessionStore:
             """
         )
 
+    async def _migration_v10(self) -> None:
+        conn = self._require_conn()
+        columns = await self._get_table_columns("project_sessions")
+        if columns and "title" not in columns:
+            await conn.execute(
+                "ALTER TABLE project_sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+            )
+
     async def _get_table_columns(self, table_name: str) -> set[str]:
         conn = self._require_conn()
         cursor = await conn.execute("PRAGMA table_info(%s)" % table_name)
@@ -381,6 +397,7 @@ class SessionStore:
         project_path: str,
         thread_id: str,
         *,
+        title: str = "",
         last_status: str = "",
         last_error: str = "",
     ) -> None:
@@ -388,17 +405,18 @@ class SessionStore:
         await conn.execute(
             """
             INSERT INTO project_sessions (
-                user_id, project_path, thread_id, updated_at, last_status, last_error
+                user_id, project_path, thread_id, title, updated_at, last_status, last_error
             )
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
             ON CONFLICT(user_id, project_path)
             DO UPDATE SET
                 thread_id=excluded.thread_id,
+                title=excluded.title,
                 updated_at=CURRENT_TIMESTAMP,
                 last_status=excluded.last_status,
                 last_error=excluded.last_error
             """,
-            (user_id, project_path, thread_id, last_status, last_error),
+            (user_id, project_path, thread_id, title, last_status, last_error),
         )
         await conn.execute(
             "DELETE FROM project_session_resets WHERE user_id = ? AND project_path = ?",
@@ -414,7 +432,7 @@ class SessionStore:
         conn = self._require_conn()
         cursor = await conn.execute(
             """
-            SELECT user_id, project_path, thread_id, updated_at, last_status, last_error
+            SELECT user_id, project_path, thread_id, title, updated_at, last_status, last_error
             FROM project_sessions
             WHERE user_id = ? AND project_path = ?
             """,
@@ -427,6 +445,7 @@ class SessionStore:
             user_id=int(row["user_id"]),
             project_path=str(row["project_path"]),
             thread_id=str(row["thread_id"]),
+            title=str(row["title"] or ""),
             updated_at=str(row["updated_at"]),
             last_status=str(row["last_status"] or ""),
             last_error=str(row["last_error"] or ""),
@@ -916,6 +935,7 @@ class SessionStore:
                     project_name=render_project_display_name(Path(project_path)),
                     is_current=project_path == current_project_path,
                     current_session_thread_id=session.thread_id if session else "",
+                    current_session_title=session.title if session else "",
                     active_run=active_run,
                     latest_run=latest_run,
                     recent_run_count=len(project_runs),

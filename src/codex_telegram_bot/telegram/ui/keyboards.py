@@ -6,6 +6,8 @@ from ...models import CodexLaunchMode, LocalCodexSession, ProjectActivitySummary
 from ...services.projects import ProjectVisibilityOption, RecentProjectOption, RepoOption
 from .texts import render_run_status_label
 
+LOCAL_SESSION_LABEL_LIMIT = 72
+
 
 def _shorten_label(value: str, *, limit: int) -> str:
     text = " ".join(value.strip().split())
@@ -15,8 +17,8 @@ def _shorten_label(value: str, *, limit: int) -> str:
 
 
 def render_local_session_button_label(session: LocalCodexSession) -> str:
-    prefix = session.updated_at.strftime("%Y-%m-%d %H:%M")
-    prompt = _shorten_label(session.first_prompt, limit=56)
+    prefix = session.updated_at.strftime("%d.%m %H:%M")
+    prompt = _shorten_label(session.first_prompt or session.title, limit=LOCAL_SESSION_LABEL_LIMIT)
     if not prompt:
         prompt = session.session_id[:8]
     return f"{prefix} · {prompt}"
@@ -66,6 +68,38 @@ def build_navigation_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_session_transcript_keyboard(
+    *,
+    session_id: str,
+    page: int,
+    total_entries: int,
+    page_size: int = 4,
+) -> InlineKeyboardMarkup:
+    total_pages = max((max(total_entries, 1) - 1) // max(page_size, 1), 0) + 1
+    current_page = min(max(page, 0), total_pages - 1)
+    rows = []
+    navigation_row = []
+    if current_page > 0:
+        navigation_row.append(
+            InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data=f"session:view:{session_id}:{current_page - 1}",
+            )
+        )
+    if current_page < total_pages - 1:
+        navigation_row.append(
+            InlineKeyboardButton(
+                "➡️ Дальше",
+                callback_data=f"session:view:{session_id}:{current_page + 1}",
+            )
+        )
+    if navigation_row:
+        rows.append(navigation_row)
+    rows.append([InlineKeyboardButton("🗂 К сессиям", callback_data="session:list")])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 def build_no_project_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -101,15 +135,17 @@ def build_repo_keyboard(entries: list[RepoOption]) -> InlineKeyboardMarkup:
 
 
 def build_local_sessions_keyboard(sessions: list[LocalCodexSession]) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                render_local_session_button_label(session),
-                callback_data=f"session:select:{session.session_id}",
-            )
-        ]
-        for session in sessions
-    ]
+    rows = []
+    for session in sessions:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    render_local_session_button_label(session),
+                    callback_data=f"session:select:{session.session_id}",
+                ),
+                InlineKeyboardButton("📄", callback_data=f"session:view:{session.session_id}"),
+            ]
+        )
     rows.extend(
         [
             [
@@ -307,6 +343,8 @@ def build_run_detail_keyboard(
         rows.append([InlineKeyboardButton("🔗 Сделать текущей", callback_data=f"run:attach:{run.run_id}")])
     if run.is_active:
         rows.append([InlineKeyboardButton("⏹ Остановить", callback_data=f"action:stop:{run.run_id}:{user_id}")])
+    if run.thread_id:
+        rows.append([InlineKeyboardButton("📄 Транскрипт", callback_data=f"session:view:{run.thread_id}")])
     rows.append([InlineKeyboardButton("📁 Открыть проект", callback_data=f"repo:select:{run.project_path}")])
     rows.append([InlineKeyboardButton("🗂 Запуски проекта", callback_data=f"run:list:{run.project_path}")])
     rows.append([InlineKeyboardButton("📊 Сводка", callback_data="workspace:list")])

@@ -13,6 +13,7 @@ from ...models import (
     ProjectActivitySummary,
     ProjectRun,
     ProjectRunStatus,
+    SessionTranscript,
 )
 from ...project_labels import render_project_display_name
 from ...services.status_line import CodexLimitStatus, StatusLineRenderer
@@ -148,6 +149,8 @@ def render_status_text(
             f"Verbose: `{verbose_level}`",
         ]
     )
+    if session and session.title:
+        lines.append(f"Сессия: `{session.title}`")
     if has_active_run:
         lines.append("Запуск: `выполняется`")
     if active_run_count:
@@ -241,6 +244,68 @@ def render_local_sessions_text(
     if active_run_limit and active_run_count >= active_run_limit:
         lines.append(f"Лимит новых запусков достигнут: `{active_run_count}/{active_run_limit}`.")
     return "\n".join(lines)
+
+
+def render_session_transcript_text(
+    *,
+    cwd: Path,
+    transcript: SessionTranscript,
+    notice: str = "",
+    page: int = 0,
+    page_size: int = 4,
+) -> str:
+    max_text_length = 3200
+    per_entry_limit = 600
+    lines = []
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(
+        [
+            "Транскрипт сессии.",
+            "",
+            f"Проект: `{render_project_display_name(cwd)}`",
+            f"Сессия: `{transcript.session_id}`",
+        ]
+    )
+    if transcript.title:
+        lines.append(f"Название: `{transcript.title}`")
+    lines.append("")
+    if not transcript.entries:
+        lines.append("Сообщения не найдены.")
+        return "\n".join(lines)
+    total = len(transcript.entries)
+    safe_page_size = max(page_size, 1)
+    max_page = max((total - 1) // safe_page_size, 0)
+    current_page = min(max(page, 0), max_page)
+    start = current_page * safe_page_size
+    end = min(start + safe_page_size, total)
+    lines.append(f"Страница `{current_page + 1}/{max_page + 1}` · сообщения `{start + 1}-{end}` из `{total}`")
+    lines.append("")
+    local_truncated = False
+    for entry in transcript.entries[start:end]:
+        label = "Пользователь" if entry.role == "user" else "Codex"
+        entry_text = " ".join(entry.text.strip().split())
+        if len(entry_text) > per_entry_limit:
+            entry_text = entry_text[: per_entry_limit - 1].rstrip() + "…"
+            local_truncated = True
+        block = f"{label}: {entry_text}"
+        candidate_lines = [*lines, block, ""]
+        if len("\n".join(candidate_lines)) > max_text_length:
+            remaining = max_text_length - len("\n".join(lines)) - len(label) - 4
+            if remaining > 8:
+                clipped = entry_text[: remaining - 1].rstrip() + "…"
+                lines.append(f"{label}: {clipped}")
+                lines.append("")
+            local_truncated = True
+            break
+        lines.append(block)
+        lines.append("")
+    if transcript.truncated or local_truncated:
+        if transcript.truncated:
+            lines.append("Загружена только часть истории сессии.")
+        if local_truncated:
+            lines.append("Транскрипт обрезан для Telegram.")
+    return "\n".join(lines).strip()
 
 
 def render_verbose_text(current_level: int) -> str:
@@ -555,9 +620,9 @@ def render_project_runs_text(
             f"#{run.run_id} · `{render_run_status_label(run.status)}` · `{_format_run_duration(run)}` · thread `{(run.thread_id or 'none')[:8]}`"
         )
         if run.last_progress_summary:
-            lines.append(run.last_progress_summary[:120])
+            lines.append(run.last_progress_summary[:90])
         elif run.first_prompt_preview:
-            lines.append(run.first_prompt_preview[:120])
+            lines.append(run.first_prompt_preview[:90])
         lines.append("")
     return "\n".join(lines).strip()
 

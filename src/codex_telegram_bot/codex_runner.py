@@ -21,6 +21,8 @@ from .models import (
     CodexStreamEvent,
     CodexStreamEventKind,
     CodexToolCall,
+    SessionTranscript,
+    SessionTranscriptEntry,
 )
 from .processes import subprocess_group_kwargs, terminate_process_tree
 
@@ -37,6 +39,8 @@ RECOVERABLE_RESUME_PATTERNS = (
     "resume failed",
     "invalid thread",
 )
+
+TRANSCRIPT_ENTRY_LIMIT = 40
 
 
 class CodexRunner:
@@ -94,6 +98,33 @@ class CodexRunner:
             if limit is not None and len(sessions) >= limit:
                 break
         return sessions
+
+    def load_session_transcript(
+        self,
+        cwd: Path,
+        session_id: str,
+        *,
+        max_entries: int = TRANSCRIPT_ENTRY_LIMIT,
+    ) -> Optional[SessionTranscript]:
+        sessions_dir = self._codex_sessions_dir()
+        if not sessions_dir.exists() or not sessions_dir.is_dir():
+            return None
+
+        target_cwd = str(cwd.expanduser().resolve())
+        for session_file in sorted(
+            self._iter_session_files(sessions_dir),
+            key=lambda path: self._safe_mtime(path),
+            reverse=True,
+        ):
+            transcript = self._read_session_transcript(
+                session_file,
+                target_cwd=target_cwd,
+                session_id=session_id,
+                max_entries=max_entries,
+            )
+            if transcript is not None:
+                return transcript
+        return None
 
     def validate_cli_available(self) -> None:
         cli_path = self.settings.codex_cli_path
@@ -197,6 +228,63 @@ class CodexRunner:
             updated_at=updated_at,
             source_path=session_file,
             first_prompt=first_prompt,
+            title=cls.build_session_title(first_prompt),
+        )
+
+    @classmethod
+    def _read_session_transcript(
+        cls,
+        session_file: Path,
+        *,
+        target_cwd: str,
+        session_id: str,
+        max_entries: int,
+    ) -> Optional[SessionTranscript]:
+        try:
+            with session_file.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline()
+                if not first_line:
+                    return None
+                try:
+                    meta = json.loads(first_line)
+                except json.JSONDecodeError:
+                    return None
+                if meta.get("type") != "session_meta":
+                    return None
+                payload = meta.get("payload") or {}
+                if str(payload.get("cwd", "")) != target_cwd:
+                    return None
+                found_session_id = str(payload.get("id", "")).strip()
+                if not found_session_id or found_session_id != session_id:
+                    return None
+
+                entries: list[SessionTranscriptEntry] = []
+                first_prompt = ""
+                truncated = False
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    entry = cls._extract_transcript_entry(event)
+                    if entry is None:
+                        continue
+                    if entry.role == "user" and not first_prompt:
+                        first_prompt = entry.text
+                    entries.append(entry)
+                    if len(entries) >= max_entries:
+                        truncated = True
+                        break
+        except OSError:
+            return None
+
+        return SessionTranscript(
+            session_id=found_session_id,
+            cwd=Path(target_cwd),
+            source_path=session_file,
+            title=cls.build_session_title(first_prompt),
+            entries=entries,
+            truncated=truncated,
         )
 
     @staticmethod
@@ -256,6 +344,73 @@ class CodexRunner:
         if lowered.startswith("<") and "agents.md" in lowered:
             return ""
         return text
+
+    @classmethod
+    def build_session_title(cls, value: object, *, max_words: int = 5, max_chars: int = 72) -> str:
+        text = cls._normalize_human_prompt(value)
+        if not text:
+            return ""
+        words = text.split()
+        title = " ".join(words[:max_words]).strip()
+        if len(title) > max_chars:
+            return title[: max_chars - 1].rstrip() + "…"
+        return title
+
+    @classmethod
+    def _extract_transcript_entry(cls, event: dict) -> Optional[SessionTranscriptEntry]:
+        event_type = event.get("type")
+        payload = event.get("payload") or {}
+        if event_type == "event_msg":
+            message_type = str(payload.get("type") or "").strip()
+            if message_type == "user_message":
+                text = cls._normalize_human_prompt(payload.get("message"))
+                if text:
+                    return SessionTranscriptEntry(role="user", text=text)
+                return None
+            if message_type == "agent_message":
+                text = cls._normalize_assistant_text(payload.get("message"))
+                if text:
+                    return SessionTranscriptEntry(role="assistant", text=text)
+                return None
+            return None
+        if event_type != "response_item":
+            return None
+        role = str(payload.get("role") or "").strip().lower()
+        if role == "user":
+            text = cls._extract_input_text(payload)
+            if text:
+                return SessionTranscriptEntry(role="user", text=text)
+            return None
+        if role == "assistant":
+            text = cls._extract_assistant_text(payload)
+            if text:
+                return SessionTranscriptEntry(role="assistant", text=text)
+            return None
+        return None
+
+    @classmethod
+    def _extract_assistant_text(cls, payload: dict) -> str:
+        content = payload.get("content")
+        if isinstance(content, str):
+            return cls._normalize_assistant_text(content)
+        if not isinstance(content, list):
+            return ""
+        for item in content:
+            if isinstance(item, str):
+                text = cls._normalize_assistant_text(item)
+            elif isinstance(item, dict) and item.get("type") in {"output_text", "text"}:
+                text = cls._normalize_assistant_text(item.get("text"))
+            else:
+                text = ""
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _normalize_assistant_text(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.strip().split())
 
     async def run(
         self,

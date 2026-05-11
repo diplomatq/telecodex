@@ -22,12 +22,14 @@ async def test_session_store_crud_and_audit(tmp_path: Path) -> None:
         100,
         "/workspace/project",
         "thread-1",
+        title="Fix Telegram callback routing",
         last_status="success",
         last_error="",
     )
     session = await store.get_session(100, "/workspace/project")
     assert session is not None
     assert session.thread_id == "thread-1"
+    assert session.title == "Fix Telegram callback routing"
     assert session.last_status == "success"
 
     await store.update_session_result(
@@ -77,7 +79,7 @@ async def test_session_store_crud_and_audit(tmp_path: Path) -> None:
     assert await store.get_session(100, "/workspace/project") is None
     assert await store.get_session_reset_at_unix(100, "/workspace/project") is not None
 
-    await store.upsert_session(100, "/workspace/project", "thread-2", last_status="success")
+    await store.upsert_session(100, "/workspace/project", "thread-2", title="Fix Telegram callback routing", last_status="success")
     assert await store.get_session_reset_at_unix(100, "/workspace/project") is None
     await store.close()
 
@@ -88,7 +90,7 @@ async def test_session_store_project_runs_and_workspace_summary(tmp_path: Path) 
     store = SessionStore(db_path)
     await store.initialize()
 
-    await store.upsert_session(100, "/workspace/api", "thread-api", last_status="success")
+    await store.upsert_session(100, "/workspace/api", "thread-api", title="Fix API telemetry", last_status="success")
     run1 = await store.create_project_run(
         user_id=100,
         project_path="/workspace/api",
@@ -132,6 +134,7 @@ async def test_session_store_project_runs_and_workspace_summary(tmp_path: Path) 
     assert summaries[0].is_current is True
     assert summaries[0].active_run is not None
     assert summaries[0].current_session_thread_id == "thread-api"
+    assert summaries[0].current_session_title == "Fix API telemetry"
     web_summary = next(summary for summary in summaries if summary.project_name == "workspace/web")
     assert web_summary.latest_run is not None
     assert web_summary.latest_run.status.value == "success"
@@ -205,6 +208,50 @@ async def test_session_store_migrates_hidden_projects_table(tmp_path: Path) -> N
     await store.set_project_hidden_state(1, "/legacy/project", hidden=True)
 
     assert await store.is_project_hidden(1, "/legacy/project") is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_store_migrates_session_title_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_titles.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version(version) VALUES (9)")
+        conn.execute(
+            """
+            CREATE TABLE project_sessions (
+                user_id INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_status TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (user_id, project_path)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE project_session_resets (
+                user_id INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                reset_at_unix REAL NOT NULL,
+                PRIMARY KEY (user_id, project_path)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = SessionStore(db_path)
+    await store.initialize()
+    await store.upsert_session(1, "/legacy/project", "thread-1", title="Fix callback flow", last_status="success")
+
+    session = await store.get_session(1, "/legacy/project")
+    assert session is not None
+    assert session.title == "Fix callback flow"
     await store.close()
 
 

@@ -62,10 +62,15 @@ def test_workspace_cli_summary_and_attach(monkeypatch: pytest.MonkeyPatch, tmp_p
             "SELECT thread_id FROM project_sessions WHERE user_id = ? AND project_path = ?",
             (42, str(project_dir.resolve())),
         ).fetchone()[0]
+        title = conn.execute(
+            "SELECT title FROM project_sessions WHERE user_id = ? AND project_path = ?",
+            (42, str(project_dir.resolve())),
+        ).fetchone()[0]
     finally:
         conn.close()
     assert current_project == str(project_dir.resolve())
     assert thread_id == "thread-123"
+    assert title == ""
 
 
 def test_workspace_cli_stop_and_project_switch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:

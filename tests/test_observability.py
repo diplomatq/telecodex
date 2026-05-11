@@ -311,7 +311,8 @@ class InMemoryStore:
                     project_path=project_path,
                     project_name=Path(project_path).name,
                     is_current=project_path == current_project_path,
-                    current_session_thread_id=self.sessions.get((user_id, project_path), ""),
+                    current_session_thread_id=(self.sessions.get((user_id, project_path)) or {}).get("thread_id", ""),
+                    current_session_title=(self.sessions.get((user_id, project_path)) or {}).get("title", ""),
                     active_run=run_obj if run_obj and run_obj.is_active else None,
                     latest_run=run_obj,
                     recent_run_count=1 if run_obj else 0,
@@ -334,17 +335,18 @@ class InMemoryStore:
             runs.append(run)
         return runs[:limit]
 
-    async def upsert_session(self, user_id: int, project_path: str, thread_id: str, *, last_status: str = "", last_error: str = "") -> None:
-        self.sessions[(user_id, project_path)] = thread_id
+    async def upsert_session(self, user_id: int, project_path: str, thread_id: str, *, title: str = "", last_status: str = "", last_error: str = "") -> None:
+        self.sessions[(user_id, project_path)] = {"thread_id": thread_id, "title": title}
 
     async def get_session(self, user_id: int, project_path: str):
-        thread_id = self.sessions.get((user_id, project_path))
-        if not thread_id:
+        session = self.sessions.get((user_id, project_path))
+        if not session:
             return None
         return ProjectSession(
             user_id=user_id,
             project_path=project_path,
-            thread_id=thread_id,
+            thread_id=session["thread_id"],
+            title=session.get("title", ""),
             updated_at="2026-04-24 00:00:00",
             last_status="selected",
             last_error="",
@@ -354,7 +356,8 @@ class InMemoryStore:
         self.sessions.pop((user_id, project_path), None)
 
     async def get_thread_id(self, user_id: int, project_path: str):
-        return self.sessions.get((user_id, project_path))
+        session = self.sessions.get((user_id, project_path))
+        return session["thread_id"] if session else None
 
     async def set_current_project(self, user_id: int, project_path: str) -> None:
         self.current_project[user_id] = project_path
@@ -448,6 +451,7 @@ def make_local_session(session_id: str, project_dir: Path, prompt: str = "Old pr
         updated_at=timestamp,
         source_path=project_dir / f"{session_id}.jsonl",
         first_prompt=prompt,
+        title=" ".join(prompt.split()[:5]) if prompt else "",
     )
 
 
@@ -533,7 +537,7 @@ async def test_status_command_returns_diagnostic_status_without_keyboard(tmp_pat
     await store.initialize()
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
-    await store.upsert_session(42, str(project_dir), "thread-abc", last_status="success")
+    await store.upsert_session(42, str(project_dir), "thread-abc", title="Fix API telemetry", last_status="success")
 
     update = FakeUpdate(user_id=42)
     context = FakeContext()
@@ -542,6 +546,7 @@ async def test_status_command_returns_diagnostic_status_without_keyboard(tmp_pat
 
     reply = update.effective_message.replies[-1]
     assert "thread-abc" in reply.text
+    assert "Сессия: <code>Fix API telemetry</code>" in reply.text
     assert "Режим: <code>Песочница</code>" in reply.text
     assert "5ч:" in reply.text
     assert "Неделя:" in reply.text
@@ -660,7 +665,7 @@ async def test_menu_command_shows_resume_action_when_project_has_saved_session(t
     project_dir.mkdir()
     store = SessionStore(tmp_path / "db.sqlite3")
     await store.initialize()
-    await store.upsert_session(42, str(project_dir), "resume-thread-123", last_status="success")
+    await store.upsert_session(42, str(project_dir), "resume-thread-123", title="Continue callback routing", last_status="success")
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
     update = FakeUpdate(user_id=42, text="/menu")
@@ -671,6 +676,7 @@ async def test_menu_command_shows_resume_action_when_project_has_saved_session(t
 
     reply = update.effective_message.replies[-1]
     assert "Быстрый старт: продолжить последнюю сессию в один тап." in reply.text
+    assert "Сессия: <code>текущая</code>" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
         ["nav:repo", "session:list"],
         ["workspace:list", "mode:show"],
@@ -704,7 +710,7 @@ async def test_sessions_command_lists_project_sessions(tmp_path: Path) -> None:
     assert "Сессии." in reply.text
     assert f"Проект: <code>{tmp_path.name}/app</code>" in reply.text
     assert keyboard_callback_data(reply.kwargs["reply_markup"]) == [
-        ["session:select:old-session"],
+        ["session:select:old-session", "session:view:old-session"],
         ["session:refresh", "action:new"],
         ["nav:menu"],
     ]
@@ -736,6 +742,7 @@ async def test_session_select_callback_saves_thread_and_next_prompt_resumes(tmp_
     session = await store.get_session(42, str(project_dir))
     assert session is not None
     assert session.thread_id == "old-session"
+    assert session.title == "Continue this work"
     assert session.last_status == "selected"
     assert callback_query.answers[-1] == ("Сессия выбрана", False)
     assert "Выбрана сессия <code>old-sess</code>." in callback_query.edits[-1][0]
@@ -743,6 +750,7 @@ async def test_session_select_callback_saves_thread_and_next_prompt_resumes(tmp_
     status_update = FakeUpdate(user_id=42, text="/status")
     await bot.status_command(status_update, context)
     assert "Thread ID: <code>old-session</code>" in status_update.effective_message.replies[-1].text
+    assert "Сессия: <code>Continue this work</code>" in status_update.effective_message.replies[-1].text
 
     text_update = FakeUpdate(user_id=42, text="continue")
     text_update.effective_message = FakeMessage(text="continue", message_id=2)
@@ -753,13 +761,106 @@ async def test_session_select_callback_saves_thread_and_next_prompt_resumes(tmp_
 
 
 @pytest.mark.asyncio
+async def test_session_view_callback_opens_transcript(tmp_path: Path) -> None:
+    from codex_telegram_bot.models import SessionTranscript, SessionTranscriptEntry
+
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    local_session = make_local_session("old-session", project_dir, "Continue this work")
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    fake_codex = FakeCodex(
+        CodexResponse(final_text="done", thread_id="old-session", status=CodexResultStatus.SUCCESS),
+        local_sessions=[local_session],
+    )
+    fake_codex.load_session_transcript = lambda cwd, session_id, max_entries=40: SessionTranscript(
+        session_id=session_id,
+        cwd=cwd,
+        source_path=project_dir / f"{session_id}.jsonl",
+        title="Continue this work",
+        entries=[
+            SessionTranscriptEntry(role="user", text="Continue this work"),
+            SessionTranscriptEntry(role="assistant", text="I will continue it."),
+        ],
+    )
+    bot.codex = fake_codex
+
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+    callback_query = FakeCallbackQuery(from_user_id=42, data="session:view:old-session")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+
+    await bot.handle_ui_callback(update, context)
+
+    assert callback_query.answers[-1] == ("Транскрипт", False)
+    assert "Транскрипт сессии." in callback_query.edits[-1][0]
+    assert "Страница <code>1/1</code>" in callback_query.edits[-1][0]
+    assert "Название: <code>Continue this work</code>" in callback_query.edits[-1][0]
+    assert "Пользователь: Continue this work" in callback_query.edits[-1][0]
+    assert "Codex: I will continue it." in callback_query.edits[-1][0]
+    assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [["session:list"], ["nav:menu"]]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_view_callback_opens_requested_transcript_page(tmp_path: Path) -> None:
+    from codex_telegram_bot.models import SessionTranscript, SessionTranscriptEntry
+
+    project_dir = tmp_path / "app"
+    project_dir.mkdir()
+    local_session = make_local_session("old-session", project_dir, "Continue this work")
+    store = SessionStore(tmp_path / "db.sqlite3")
+    await store.initialize()
+    settings = make_settings(tmp_path)
+    bot = CodexTelegramBot(settings, store)
+    fake_codex = FakeCodex(
+        CodexResponse(final_text="done", thread_id="old-session", status=CodexResultStatus.SUCCESS),
+        local_sessions=[local_session],
+    )
+    fake_codex.load_session_transcript = lambda cwd, session_id, max_entries=40: SessionTranscript(
+        session_id=session_id,
+        cwd=cwd,
+        source_path=project_dir / f"{session_id}.jsonl",
+        title="Continue this work",
+        entries=[
+            SessionTranscriptEntry(role="user", text="message 1"),
+            SessionTranscriptEntry(role="assistant", text="message 2"),
+            SessionTranscriptEntry(role="user", text="message 3"),
+            SessionTranscriptEntry(role="assistant", text="message 4"),
+            SessionTranscriptEntry(role="user", text="message 5"),
+        ],
+    )
+    bot.codex = fake_codex
+
+    context = FakeContext()
+    context.user_data["current_directory"] = project_dir
+    callback_query = FakeCallbackQuery(from_user_id=42, data="session:view:old-session:1")
+    update = FakeUpdate(user_id=42, callback_query=callback_query)
+
+    await bot.handle_ui_callback(update, context)
+
+    assert callback_query.answers[-1] == ("Транскрипт", False)
+    assert "Страница <code>2/2</code>" in callback_query.edits[-1][0]
+    assert "message 5" in callback_query.edits[-1][0]
+    assert "message 1" not in callback_query.edits[-1][0]
+    assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
+        ["session:view:old-session:0"],
+        ["session:list"],
+        ["nav:menu"],
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_manual_session_select_after_new_session_reset_is_allowed(tmp_path: Path) -> None:
     project_dir = tmp_path / "app"
     project_dir.mkdir()
     local_session = make_local_session("old-session", project_dir, "Return to previous thread")
     store = SessionStore(tmp_path / "db.sqlite3")
     await store.initialize()
-    await store.upsert_session(42, str(project_dir), "old-session", last_status="success")
+    await store.upsert_session(42, str(project_dir), "old-session", title="Return to previous thread", last_status="success")
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
     bot.codex = FakeCodex(
@@ -786,6 +887,7 @@ async def test_manual_session_select_after_new_session_reset_is_allowed(tmp_path
     selected = await store.get_session(42, str(project_dir))
     assert selected is not None
     assert selected.thread_id == "old-session"
+    assert selected.title == "Return to previous thread"
     await store.close()
 
 
@@ -795,7 +897,7 @@ async def test_resume_current_session_callback_opens_chat_ready_screen(tmp_path:
     project_dir.mkdir()
     store = SessionStore(tmp_path / "db.sqlite3")
     await store.initialize()
-    await store.upsert_session(42, str(project_dir), "resume-thread-123456", last_status="success")
+    await store.upsert_session(42, str(project_dir), "resume-thread-123456", title="Resume callback routing", last_status="success")
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
     context = FakeContext()
@@ -845,7 +947,7 @@ async def test_resume_current_session_callback_respects_active_run_guard(tmp_pat
     project_dir = tmp_path / "app"
     project_dir.mkdir()
     store = InMemoryStore()
-    await store.upsert_session(42, str(project_dir), "resume-thread-123456", last_status="success")
+    await store.upsert_session(42, str(project_dir), "resume-thread-123456", title="Resume callback routing", last_status="success")
     settings = make_settings(tmp_path)
     bot = CodexTelegramBot(settings, store)
     context = FakeContext()
@@ -1240,6 +1342,7 @@ async def test_run_detail_open_project_callback_uses_project_path_key(tmp_path: 
 
     assert keyboard_callback_data(callback_query.edits[-1][1]["reply_markup"]) == [
         ["run:attach:1"],
+        ["session:view:thread-attach"],
         [f"repo:select:{str(project_dir)}"],
         [f"run:list:{str(project_dir)}"],
         ["workspace:list"],

@@ -544,6 +544,7 @@ class PromptExecutionFlow:
             project_path=str(cwd),
             previous_thread_id=previous_thread_id,
             response=response,
+            session_title=self._build_session_title(prepared_request.prompt),
         )
         await self.session_store.update_project_run(
             run_id,
@@ -635,12 +636,14 @@ class PromptExecutionFlow:
         project_path: str,
         previous_thread_id: Optional[str],
         response: CodexResponse,
+        session_title: str,
     ) -> None:
         if response.thread_id:
             await self.session_store.upsert_session(
                 user_id,
                 project_path,
                 response.thread_id,
+                title=session_title,
                 last_status=str(response.status),
                 last_error=response.error_message,
             )
@@ -677,6 +680,7 @@ class PromptExecutionFlow:
             user_id,
             str(cwd),
             discovered_thread_id,
+            title="",
             last_status="discovered",
         )
         await self.observability.record_event(
@@ -811,3 +815,9 @@ class PromptExecutionFlow:
     def _build_prompt_preview(prompt: str) -> str:
         text = " ".join(prompt.strip().split())
         return text[:160]
+
+    @staticmethod
+    def _build_session_title(prompt: str) -> str:
+        from ..codex_runner import CodexRunner
+
+        return CodexRunner.build_session_title(prompt)

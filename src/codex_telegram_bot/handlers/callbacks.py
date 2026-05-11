@@ -148,6 +148,19 @@ class CallbackHandlers:
             )
             return
 
+        if data.startswith("session:view:"):
+            parts = data.split(":", 3)
+            session_id = parts[2]
+            page = int(parts[3]) if len(parts) > 3 else 0
+            await self.navigation.show_session_transcript(
+                update,
+                context,
+                request_context,
+                session_id,
+                page=page,
+            )
+            return
+
         if data == "action:new":
             project = await self.navigation.projects.resolve_current_project(
                 context,

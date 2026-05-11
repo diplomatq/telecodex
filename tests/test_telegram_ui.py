@@ -13,6 +13,8 @@ from codex_telegram_bot.models import (
     ProjectActivitySummary,
     ProjectRun,
     ProjectRunStatus,
+    SessionTranscript,
+    SessionTranscriptEntry,
 )
 from codex_telegram_bot.services.projects import ProjectVisibilityOption, RecentProjectOption, RepoOption
 from codex_telegram_bot.telegram.ui.keyboards import (
@@ -22,6 +24,7 @@ from codex_telegram_bot.telegram.ui.keyboards import (
     build_project_runs_keyboard,
     build_repo_keyboard,
     build_run_detail_keyboard,
+    build_session_transcript_keyboard,
     build_settings_keyboard,
     build_session_keyboard,
     build_workspace_keyboard,
@@ -126,15 +129,31 @@ def test_build_local_sessions_keyboard_uses_prompt_and_short_id_fallback() -> No
     markup = build_local_sessions_keyboard(sessions)
 
     assert keyboard_callback_data(markup) == [
-        ["session:select:session-with-prompt"],
-        ["session:select:fallback-session"],
+        ["session:select:session-with-prompt", "session:view:session-with-prompt"],
+        ["session:select:fallback-session", "session:view:fallback-session"],
         ["session:refresh", "action:new"],
         ["nav:menu"],
     ]
-    assert markup.inline_keyboard[0][0].text == (
-        "2026-04-22 18:30 · Fix the Telegram session picker routing"
+    assert markup.inline_keyboard[0][0].text == "22.04 18:30 · Fix the Telegram session picker routing"
+    assert markup.inline_keyboard[1][0].text == "22.04 18:30 · fallback"
+
+
+def test_build_local_sessions_keyboard_prefers_full_prompt_over_short_title() -> None:
+    updated_at = datetime(2026, 4, 22, 18, 30)
+    session = LocalCodexSession(
+        session_id="session-with-title",
+        cwd=Path("/tmp/app"),
+        created_at=updated_at,
+        updated_at=updated_at,
+        source_path=Path("/tmp/session-with-title.jsonl"),
+        first_prompt="Fix the Telegram session picker routing for long project labels in one line",
+        title="Fix the Telegram session picker",
     )
-    assert markup.inline_keyboard[1][0].text == "2026-04-22 18:30 · fallback"
+
+    markup = build_local_sessions_keyboard([session])
+
+    assert "for long project labels" in markup.inline_keyboard[0][0].text
+    assert "Fix the Telegram session picker routing" in markup.inline_keyboard[0][0].text
 
 
 def test_build_repo_keyboard_ends_with_back_to_menu() -> None:
@@ -426,6 +445,7 @@ def test_project_run_and_detail_keyboards() -> None:
     assert keyboard_callback_data(detail_markup) == [
         ["run:attach:9"],
         ["action:stop:9:42"],
+        ["session:view:thread-123"],
         ["repo:select:/tmp/api"],
         ["run:list:/tmp/api"],
         ["workspace:list"],
@@ -463,6 +483,87 @@ def test_render_project_runs_and_run_detail_text() -> None:
     assert "#9" in list_text
     assert "Карточка процесса." in detail_text
     assert "Первый инструмент: `Read`" in detail_text
+
+
+def test_render_session_transcript_text() -> None:
+    from codex_telegram_bot.telegram.ui.texts import render_session_transcript_text
+
+    transcript = SessionTranscript(
+        session_id="session-1",
+        cwd=Path("/tmp/api"),
+        source_path=Path("/tmp/session.jsonl"),
+        title="Fix Telegram callback routing",
+        entries=[
+            SessionTranscriptEntry(role="user", text="Fix Telegram callback routing now"),
+            SessionTranscriptEntry(role="assistant", text="I will inspect the callback flow."),
+        ],
+    )
+
+    text = render_session_transcript_text(cwd=Path("/tmp/api"), transcript=transcript)
+
+    assert "Транскрипт сессии." in text
+    assert "Страница `1/1`" in text
+    assert "Название: `Fix Telegram callback routing`" in text
+    assert "Пользователь: Fix Telegram callback routing now" in text
+    assert "Codex: I will inspect the callback flow." in text
+
+
+def test_render_session_transcript_text_supports_pagination() -> None:
+    from codex_telegram_bot.telegram.ui.texts import render_session_transcript_text
+
+    transcript = SessionTranscript(
+        session_id="session-1",
+        cwd=Path("/tmp/api"),
+        source_path=Path("/tmp/session.jsonl"),
+        entries=[
+            SessionTranscriptEntry(role="user", text="message 1"),
+            SessionTranscriptEntry(role="assistant", text="message 2"),
+            SessionTranscriptEntry(role="user", text="message 3"),
+            SessionTranscriptEntry(role="assistant", text="message 4"),
+            SessionTranscriptEntry(role="user", text="message 5"),
+        ],
+    )
+
+    first_page = render_session_transcript_text(cwd=Path("/tmp/api"), transcript=transcript, page=0, page_size=4)
+    second_page = render_session_transcript_text(cwd=Path("/tmp/api"), transcript=transcript, page=1, page_size=4)
+
+    assert "Страница `1/2` · сообщения `1-4` из `5`" in first_page
+    assert "message 4" in first_page
+    assert "message 5" not in first_page
+    assert "Страница `2/2` · сообщения `5-5` из `5`" in second_page
+    assert "message 5" in second_page
+
+
+def test_render_session_transcript_text_limits_long_output() -> None:
+    from codex_telegram_bot.telegram.ui.texts import render_session_transcript_text
+
+    long_text = "Long transcript fragment " * 400
+    transcript = SessionTranscript(
+        session_id="session-1",
+        cwd=Path("/tmp/api"),
+        source_path=Path("/tmp/session.jsonl"),
+        title="Very long transcript",
+        entries=[
+            SessionTranscriptEntry(role="user", text=long_text),
+            SessionTranscriptEntry(role="assistant", text=long_text),
+            SessionTranscriptEntry(role="assistant", text=long_text),
+        ],
+    )
+
+    text = render_session_transcript_text(cwd=Path("/tmp/api"), transcript=transcript)
+
+    assert len(text) < 3300
+    assert "Транскрипт обрезан для Telegram." in text
+
+
+def test_build_session_transcript_keyboard_supports_pagination() -> None:
+    markup = build_session_transcript_keyboard(session_id="session-1", page=1, total_entries=9, page_size=4)
+
+    assert keyboard_callback_data(markup) == [
+        ["session:view:session-1:0", "session:view:session-1:2"],
+        ["session:list"],
+        ["nav:menu"],
+    ]
 
 
 @pytest.mark.asyncio

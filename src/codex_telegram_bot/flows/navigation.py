@@ -22,6 +22,7 @@ from ..telegram.ui.keyboards import (
     build_project_visibility_keyboard,
     build_repo_keyboard,
     build_run_detail_keyboard,
+    build_session_transcript_keyboard,
     build_settings_keyboard,
     build_session_keyboard,
     build_verbose_keyboard,
@@ -32,6 +33,7 @@ from ..telegram.ui.texts import (
     render_home_text,
     render_no_projects_text,
     render_local_sessions_text,
+    render_session_transcript_text,
     render_project_runs_text,
     render_project_created_text,
     render_project_selected_text,
@@ -365,6 +367,61 @@ class NavigationFlow:
             return
         await self.responder.send_ui_message(update=update, text=text, reply_markup=reply_markup)
 
+    async def show_session_transcript(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        request_context,
+        session_id: str,
+        *,
+        page: int = 0,
+    ) -> None:
+        query = update.callback_query
+        project = await self.projects.resolve_current_project(context, request_context=request_context)
+        if project.path is None:
+            await query.answer("Сначала выбери проект.", show_alert=True)
+            await self.responder.edit_ui_message(
+                update,
+                render_no_projects_text(),
+                reply_markup=build_no_project_keyboard(),
+            )
+            return
+
+        transcript = await asyncio.to_thread(
+            self.execution.codex.load_session_transcript,
+            project.path,
+            session_id,
+        )
+        if transcript is None:
+            await query.answer("Транскрипт не найден.", show_alert=True)
+            await self.show_sessions(
+                update,
+                context,
+                request_context,
+                edit=True,
+                notice="Список сессий обновлён.",
+            )
+            return
+
+        await self.observability.record_event(
+            "telegram_session_transcript_opened",
+            request_context,
+            audit_event="telegram_session_transcript_opened",
+            project_path=str(project.path),
+            thread_id=session_id,
+            transcript_entry_count=len(transcript.entries),
+        )
+        await query.answer("Транскрипт")
+        await self.responder.edit_ui_message(
+            update,
+            render_session_transcript_text(cwd=project.path, transcript=transcript, page=page),
+            reply_markup=build_session_transcript_keyboard(
+                session_id=session_id,
+                page=page,
+                total_entries=len(transcript.entries),
+            ),
+        )
+
     async def select_session_from_callback(
         self,
         update: Update,
@@ -406,6 +463,7 @@ class NavigationFlow:
             user_id,
             str(project.path),
             selected.session_id,
+            title=selected.title,
             last_status="selected",
         )
         await self.observability.record_event(
@@ -964,6 +1022,7 @@ class NavigationFlow:
             update.effective_user.id,
             run.project_path,
             run.thread_id,
+            title=self.execution.codex.build_session_title(run.first_prompt_preview),
             last_status="selected",
         )
         await self.observability.record_event(
